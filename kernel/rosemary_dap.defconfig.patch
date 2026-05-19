@@ -1,0 +1,84 @@
+# Kernel defconfig patch for EgePod DAP mode.
+# Apply against the stock rosemary_defconfig before building:
+#
+#   cd <kernel_source>
+#   patch arch/arm64/configs/rosemary_defconfig < kernel/rosemary_dap.defconfig.patch
+#
+# Or use scripts/config to toggle individual options after make rosemary_defconfig.
+
+--- a/arch/arm64/configs/rosemary_defconfig
++++ b/arch/arm64/configs/rosemary_defconfig
+
+# ── Timer & scheduler ────────────────────────────────────────────────────────
+-CONFIG_HZ_300=y
++CONFIG_HZ_100=y
++CONFIG_NO_HZ_FULL=y
++CONFIG_NO_HZ_FULL_ALL=y
++CONFIG_RCU_NOCB_CPU=y
+ CONFIG_PREEMPT=y
+
+# ── CPU frequency ────────────────────────────────────────────────────────────
++CONFIG_CPU_FREQ_GOV_POWERSAVE=y
++CONFIG_CPU_FREQ_GOV_USERSPACE=y
+ CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y
+
+# ── Audio — keep the MT6359 codec stack ─────────────────────────────────────
+ CONFIG_SND=y
+ CONFIG_SND_SOC=y
+ CONFIG_SND_SOC_MT6785=y
+ CONFIG_SND_SOC_MT6359=y
++CONFIG_SND_SOC_MT6359_ACCDET=n    # headset detection handled by uid
+
+# ── Radios — REMOVE entirely ─────────────────────────────────────────────────
+-CONFIG_BT=y
+-CONFIG_BT_HCIUART=y
++CONFIG_BT=n
+-CONFIG_WLAN=y
+-CONFIG_MTK_COMBO_WIFI=y
++CONFIG_WLAN=n
++CONFIG_MTK_COMBO_WIFI=n
+-CONFIG_MTK_MODEM_CCCI_SUPPORT=y
++CONFIG_MTK_MODEM_CCCI_SUPPORT=n
+-CONFIG_MTK_MD_DIRECT_TETHERING=y
++CONFIG_MTK_MD_DIRECT_TETHERING=n
+
+# ── Camera / ISP — not needed ────────────────────────────────────────────────
+-CONFIG_VIDEO_MTK_ISP_CAMSYS=y
++CONFIG_VIDEO_MTK_ISP_CAMSYS=n
+-CONFIG_MEDIA_SUPPORT=y
++CONFIG_MEDIA_SUPPORT=n
+
+# ── GPU — keep the driver loaded for future use but disable power by default ─
+ CONFIG_MTK_GPU_SUPPORT=y
++CONFIG_MTK_GPU_ALWAYS_ON=n       # power policy controlled via sysfs by pwrd
+
+# ── Framebuffer ──────────────────────────────────────────────────────────────
+ CONFIG_FB=y
+ CONFIG_FB_MTK=y
++CONFIG_FB_MTK_ESD_CHECK_INTERVAL=0   # disable ESD polling; saves ~1 mA
+
+# ── Input ────────────────────────────────────────────────────────────────────
+ CONFIG_INPUT=y
+ CONFIG_INPUT_TOUCHSCREEN=y
+ CONFIG_INPUT_EVDEV=y
++CONFIG_INPUT_KEYBOARD=y
++CONFIG_KEYBOARD_GPIO=y
+
+# ── USB — keep only for ADB debugging ────────────────────────────────────────
+ CONFIG_USB_GADGET=y
+ CONFIG_USB_CONFIGFS=y
+-CONFIG_USB_CONFIGFS_MASS_STORAGE=y
++CONFIG_USB_CONFIGFS_MASS_STORAGE=n
++CONFIG_USB_CONFIGFS_F_FS=y      # ADB via functionfs
+
+# ── Memory ──────────────────────────────────────────────────────────────────
++CONFIG_TRANSPARENT_HUGEPAGE=y   # improve PCM buffer TLB coverage
++CONFIG_MLOCK_MLOCKALL=y        # allow mlock of large PCM buffers
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+-CONFIG_MTK_VIBRATOR=y
++CONFIG_MTK_VIBRATOR=n
+-CONFIG_LEDS_VIBRATOR=y
++CONFIG_LEDS_VIBRATOR=n
+ CONFIG_LEDS_MT65XX=y            # keep for lcd-backlight sysfs node
++CONFIG_RFKILL=y                 # needed by pwrd rfkill.c

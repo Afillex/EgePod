@@ -1,0 +1,4 @@
+out/
+*.raw
+*.raw.page
+nohup.out

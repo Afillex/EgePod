@@ -1,0 +1,65 @@
+# Simulation build — runs inside OrbStack Ubuntu AArch64 VM.
+# Uses native clang + system ALSA instead of tinyalsa + NDK.
+# Usage (inside VM): make -f sim/Makefile.sim
+#
+# Key differences from production build:
+#   SIMULATE=1        → sysfs writes go to EGEPOD_SYSFS_ROOT (fake tree)
+#   USE_ALSA_LIB=1    → links against system libasound instead of tinyalsa
+#   MUSIC_DIR=/sdcard/Music (same as production)
+
+CC      := clang
+CFLAGS  := -O1 -g \
+           -std=c11 \
+           -Wall -Wextra -Wno-unused-parameter \
+           -D_GNU_SOURCE \
+           -DSIMULATE=1 \
+           -DUSE_ALSA_LIB=1 \
+           -DMUSIC_DIR=\"/sdcard/Music\" \
+           -Isrc \
+           -Ivendor
+
+LDFLAGS := -lpthread -lasound -lm
+
+OUT := out/sim
+
+all: $(OUT)/egepod_audiod $(OUT)/egepod_pwrd $(OUT)/egepod_uid $(OUT)/fb_viewer
+
+$(OUT):
+	mkdir -p $(OUT)
+
+# ── audiod ────────────────────────────────────────────────────────────────────
+AUDIOD_SRC := src/audiod/main.c        \
+              src/audiod/player.c      \
+              src/audiod/decoder.c     \
+              src/audiod/alsa_out_sim.c \
+              src/audiod/index.c
+
+$(OUT)/egepod_audiod: $(AUDIOD_SRC) | $(OUT)
+	$(CC) $(CFLAGS) $(AUDIOD_SRC) $(LDFLAGS) -o $@
+
+# ── pwrd ──────────────────────────────────────────────────────────────────────
+PWRD_SRC := src/pwrd/main.c   \
+            src/pwrd/cpu.c    \
+            src/pwrd/rfkill.c
+
+$(OUT)/egepod_pwrd: $(PWRD_SRC) | $(OUT)
+	$(CC) $(CFLAGS) $(PWRD_SRC) $(LDFLAGS) -o $@
+
+# ── uid ───────────────────────────────────────────────────────────────────────
+UID_SRC := src/uid/main.c       \
+           src/uid/fb.c         \
+           src/uid/input.c      \
+           src/uid/render.c     \
+           src/uid/ipc_client.c
+
+$(OUT)/egepod_uid: $(UID_SRC) | $(OUT)
+	$(CC) $(CFLAGS) $(UID_SRC) $(LDFLAGS) -o $@
+
+# ── framebuffer viewer (SDL2 window, reads /dev/fb0 in a loop) ────────────────
+$(OUT)/fb_viewer: sim/fb_viewer.c | $(OUT)
+	$(CC) -O2 -std=c11 sim/fb_viewer.c \
+	    $(shell sdl2-config --cflags) $(shell sdl2-config --libs) \
+	    -o $@
+
+clean:
+	rm -rf $(OUT)

@@ -1,0 +1,55 @@
+# Android init language service definitions for EgePod DAP OS.
+# Place in /system/etc/init/egepod.rc
+# Init reads this after the primary init.rc; services start on boot.
+
+# ── Power daemon ─────────────────────────────────────────────────────────────
+# Must be the first service started. Applies CPU hotplug and rfkill policy
+# before audiod and uid touch any hardware.
+service egepod_pwrd /system/bin/egepod_pwrd
+    class main
+    user root            # needs sysfs/rfkill write access
+    group system
+    oneshot              # policy writes are idempotent; no need to restart
+    seclabel u:r:egepod:s0
+    writepid /dev/cpuset/system/tasks
+
+# Wait for pwrd to signal readiness before starting audio and UI.
+wait /tmp/egepod_pwrd_ready 5
+
+# ── Audio daemon ──────────────────────────────────────────────────────────────
+service egepod_audiod /system/bin/egepod_audiod
+    class main
+    user system
+    group system sdcard_r audio
+    socket egepod_audiod seqpacket 0660 system system
+    restart_on_failure restart
+    seclabel u:r:egepod:s0
+    writepid /dev/cpuset/audio-app/tasks
+
+wait /tmp/egepod_audiod_ready 10
+
+# ── UI daemon ─────────────────────────────────────────────────────────────────
+service egepod_uid /system/bin/egepod_uid
+    class main
+    user system
+    group system graphics input
+    restart_on_failure restart
+    seclabel u:r:egepod:s0
+    writepid /dev/cpuset/foreground/tasks
+
+# ── Disable stock services we don't need ─────────────────────────────────────
+# Comment these out if you need ADB.
+# stop surfaceflinger
+# stop audioserver
+# stop mediaserver
+# stop wificond
+# stop bluetooth
+
+on boot
+    # Lock the audio CPU (cpu1) to the audio cpuset so the kernel scheduler
+    # cannot migrate the SCHED_FIFO playback thread.
+    write /dev/cpuset/audio-app/cpus 0-5
+    write /dev/cpuset/audio-app/mems 0
+
+    # Disable kernel audit noise in logs
+    write /proc/sys/kernel/printk "3 4 1 3"
