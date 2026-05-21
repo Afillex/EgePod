@@ -24,6 +24,7 @@
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <signal.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -32,6 +33,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <time.h>
 
 /* ── forward declarations from ipc_client.c ─────────────────────────────── */
 int ipc_connect(const char *path);
@@ -42,6 +45,31 @@ int ipc_recv(int fd, IpcMsg *out);
 
 static volatile int   g_quit          = 0;
 static int            g_screen_on     = 1;
+static int            g_progress_tfd  = -1;  /* 20 Hz timerfd for progress bar redraws */
+
+static int64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void progress_timer_arm(void)
+{
+    if (g_progress_tfd < 0) return;
+    struct itimerspec its = {
+        .it_value    = { .tv_nsec = 50000000 },   /* 50 ms first fire */
+        .it_interval = { .tv_nsec = 50000000 },   /* 20 Hz */
+    };
+    timerfd_settime(g_progress_tfd, 0, &its, NULL);
+}
+
+static void progress_timer_disarm(void)
+{
+    if (g_progress_tfd < 0) return;
+    struct itimerspec its = { {0,0}, {0,0} };
+    timerfd_settime(g_progress_tfd, 0, &its, NULL);
+}
 static int            g_lib_fetch_idx = -1;  /* next track idx to fetch; -1 = done */
 static pthread_t      g_render_tid;
 static sem_t          g_render_sem;     /* posted when a new frame is needed */
@@ -135,6 +163,13 @@ int main(void)
         epoll_ctl(ep, EPOLL_CTL_ADD, pwrd_fd, &ev);
     }
 
+    /* 20 Hz progress-bar redraw timer — armed only while PLAYING */
+    g_progress_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (g_progress_tfd >= 0) {
+        ev.events = EPOLLIN; ev.data.fd = g_progress_tfd;
+        epoll_ctl(ep, EPOLL_CTL_ADD, g_progress_tfd, &ev);
+    }
+
     InputCtx *input = input_open(ep);
 
     /* Initial draw */
@@ -221,9 +256,14 @@ int main(void)
                         break;
                     case EVT_STATE:
                         g_ui.state = msg.param.player_state;
+                        if (msg.param.player_state == PLAYER_PLAYING)
+                            progress_timer_arm();
+                        else
+                            progress_timer_disarm();
                         break;
                     case EVT_POSITION:
-                        g_ui.position_ms = msg.param.position_ms;
+                        g_ui.position_ms      = msg.param.position_ms;
+                        g_ui.pos_ref_mono_ms  = mono_ms();
                         break;
                     default: break;
                     }
@@ -248,6 +288,14 @@ int main(void)
                     pthread_mutex_unlock(&g_ui_lock);
                     if (g_screen_on) request_redraw();
                 }
+                continue;
+            }
+
+            /* ── progress bar redraw timer ── */
+            if (fd == g_progress_tfd) {
+                uint64_t expirations;
+                (void)read(g_progress_tfd, &expirations, sizeof(expirations));
+                if (g_screen_on) request_redraw();
                 continue;
             }
 
@@ -391,9 +439,10 @@ int main(void)
     g_quit = 1;
     sem_post(&g_render_sem);   /* unblock render thread so it can exit */
     pthread_join(g_render_tid, NULL);
-    if (input)     input_close(input);
-    if (audiod_fd >= 0) close(audiod_fd);
-    if (pwrd_fd   >= 0) close(pwrd_fd);
+    if (input)            input_close(input);
+    if (audiod_fd >= 0)   close(audiod_fd);
+    if (pwrd_fd   >= 0)   close(pwrd_fd);
+    if (g_progress_tfd >= 0) close(g_progress_tfd);
     close(ep);
     fb_close(&g_fb);
     sem_destroy(&g_render_sem);

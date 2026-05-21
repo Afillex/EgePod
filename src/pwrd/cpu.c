@@ -50,15 +50,6 @@ static int sysfs_write(const char *path, const char *value)
     return 0;
 }
 
-static int sysfs_read_u32(const char *path, uint32_t *out)
-{
-    FILE *f = fopen(path, "r");
-    if (!f) return -errno;
-    int rc = fscanf(f, "%u", out);
-    fclose(f);
-    return (rc == 1) ? 0 : -EIO;
-}
-
 /* ── power policy ──────────────────────────────────────────────────────── */
 
 int cpu_apply_dap_policy(void)

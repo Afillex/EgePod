@@ -54,6 +54,7 @@ typedef struct {
     TrackInfo   track;
     PlayerState state;
     uint32_t    position_ms;
+    int64_t     pos_ref_mono_ms;   /* monotonic ms when position_ms was last received */
     uint32_t    battery_pct;
     uint32_t    track_count;
     uint32_t    cur_track_idx;

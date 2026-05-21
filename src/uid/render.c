@@ -319,16 +319,6 @@ static void draw_vinyl(uint32_t *buf, uint32_t stride,
         }
     }
 
-    if (state == PLAYER_PLAYING) {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        double t     = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
-        double angle = t * 1.2;   /* ~0.19 rps orbit */
-        int orbit_r  = label_r + 16;
-        int dot_cx   = cx + (int)((double)orbit_r * cos(angle));
-        int dot_cy   = cy + (int)((double)orbit_r * sin(angle));
-        buf_fill_circle(buf, stride, W_FB, H_FB, dot_cx, dot_cy, 4, C_TEXT);
-    }
 }
 
 /* ── Transport icons ────────────────────────────────────────────────────── */
@@ -595,18 +585,45 @@ void render_frame(FbCtx *fb, const UiState *st)
                        PROG_W, PROG_H, PROG_H/2, C_PROG_BG);
 
         if (st->track.duration_ms > 0) {
-            /* Single formula for fill and dot so they always share the same x. */
-            int filled = (int)((uint64_t)st->position_ms * PROG_W
-                               / st->track.duration_ms);
-            if (filled < 0)      filled = 0;
-            if (filled > PROG_W) filled = PROG_W;
+            /* Interpolate position forward from last audiod update using
+             * wall-clock time, so the bar moves smoothly between 5 Hz events. */
+            uint32_t disp_ms = st->position_ms;
+            if (st->state == PLAYER_PLAYING && st->pos_ref_mono_ms > 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                int64_t now_ms = (int64_t)ts.tv_sec * 1000
+                               + ts.tv_nsec / 1000000;
+                int64_t delta = now_ms - st->pos_ref_mono_ms;
+                if (delta > 0 && delta < 1000) {   /* cap at 1 s of extrapolation */
+                    disp_ms += (uint32_t)delta;
+                    if (disp_ms > st->track.duration_ms)
+                        disp_ms = st->track.duration_ms;
+                }
+            }
 
-            if (filled > 0)
+            /* Float fill width for sub-pixel antialiasing of the leading edge. */
+            float filled_f = (float)disp_ms * (float)PROG_W
+                             / (float)st->track.duration_ms;
+            if (filled_f < 0.0f)         filled_f = 0.0f;
+            if (filled_f > (float)PROG_W) filled_f = (float)PROG_W;
+            int   filled_i = (int)filled_f;
+            float frac     = filled_f - (float)filled_i;
+
+            if (filled_i > 0)
                 buf_fill_rrect(buf, stride, W_FB, H_FB, PROG_X, PROG_Y,
-                               filled, PROG_H, PROG_H/2, C_PROG_FG);
+                               filled_i, PROG_H, PROG_H/2, C_PROG_FG);
+
+            /* Antialias leading edge: blend one extra column proportional to frac
+             * so the fill bar expands continuously rather than in 1-px jumps. */
+            if (frac > 0.01f && PROG_X + filled_i < PROG_X + PROG_W) {
+                uint8_t ea = (uint8_t)(frac * 255.0f);
+                for (int ly = PROG_Y; ly < PROG_Y + PROG_H; ly++)
+                    blend_pixel(buf, stride, PROG_X + filled_i, ly,
+                                C_PROG_FG, ea, W_FB, H_FB);
+            }
 
             buf_fill_circle(buf, stride, W_FB, H_FB,
-                            PROG_X + filled, PROG_Y + PROG_H/2, 5, C_TEXT);
+                            PROG_X + filled_i, PROG_Y + PROG_H/2, 5, C_TEXT);
         }
     }
 

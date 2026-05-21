@@ -1,0 +1,129 @@
+<style>
+.epod-stage { display: flex; justify-content: center; padding: 1.5rem 0.5rem; background: var(--color-background-secondary); border-radius: var(--border-radius-lg); }
+.epod-phone { width: 320px; background: #050807; border-radius: 38px; padding: 11px; border: 1px solid #1a1f1c; }
+.epod-screen {
+  position: relative;
+  border-radius: 28px;
+  padding: 12px 14px 16px;
+  font-family: var(--font-sans);
+  background: #0c1410 url('data:image/jpeg;base64,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') center/cover;
+  overflow: hidden;
+}
+.epod-overlay { position: absolute; inset: 0; background: rgba(8, 18, 14, 0.62); }
+.epod-content { position: relative; }
+.epod-status { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 11px; color: #ffd60a; padding: 2px 4px 10px; letter-spacing: 1px; text-transform: uppercase; }
+.epod-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.epod-logo { font-family: var(--font-mono); font-size: 22px; font-weight: 500; letter-spacing: -1px; color: #ffd60a; text-transform: uppercase; line-height: 1; }
+.epod-logo .pink { color: #ff3b8c; }
+.epod-search { width: 36px; height: 36px; border-radius: 10px; background: #00e5d0; display: flex; align-items: center; justify-content: center; color: #0c1410; font-size: 18px; border: 2px solid #0c1410; }
+.epod-memphis { display: flex; height: 7px; margin-bottom: 14px; border-radius: 2px; overflow: hidden; border: 1.5px solid #050807; }
+.epod-memphis > div { flex: 1; }
+.epod-m1 { background: #ff3b8c; } .epod-m2 { background: #00e5d0; } .epod-m3 { background: #ffd60a; } .epod-m4 { background: #a574ed; } .epod-m5 { background: #4ea65f; }
+.epod-lcd { background: #061309; border: 2px solid #4ea65f; border-radius: 6px; padding: 14px 12px 12px; margin-bottom: 14px; font-family: var(--font-mono); position: relative; }
+.epod-lcd-label { position: absolute; top: -9px; left: 14px; background: #ff3b8c; color: #ffffff; font-size: 11px; padding: 1px 8px; letter-spacing: 1.5px; font-weight: 500; text-transform: uppercase; border-radius: 2px; }
+.epod-lcd-track { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; gap: 8px; }
+.epod-lcd-title { color: #4ea65f; font-size: 14px; font-weight: 500; letter-spacing: 0.5px; text-transform: uppercase; }
+.epod-lcd-time { color: #ffd60a; font-size: 13px; font-variant-numeric: tabular-nums; }
+.epod-lcd-artist { color: #2d6938; font-size: 11px; letter-spacing: 1.2px; text-transform: uppercase; margin-bottom: 10px; font-weight: 500; }
+.epod-eq { display: flex; gap: 3px; height: 22px; align-items: flex-end; }
+.epod-eq-bar { flex: 1; background: #4ea65f; border-radius: 1px; }
+.epod-eq-bar.alt { background: #00e5d0; }
+.epod-controls { display: flex; gap: 6px; margin-bottom: 16px; }
+.epod-btn { flex: 1; height: 42px; border-radius: 10px; background: rgba(255, 255, 255, 0.1); border: 2px solid rgba(255, 255, 255, 0.22); color: #f4ecce; display: flex; align-items: center; justify-content: center; font-size: 17px; }
+.epod-btn.play { flex: 1.5; background: #ff3b8c; border-color: #ffffff; color: #ffffff; font-size: 20px; }
+.epod-section-label { font-family: var(--font-mono); font-size: 11px; color: #00e5d0; letter-spacing: 2.5px; margin: 4px 2px 10px; text-transform: uppercase; font-weight: 500; display: flex; align-items: center; gap: 8px; }
+.epod-section-label::after { content: ''; flex: 1; height: 2px; background: #00e5d0; }
+.epod-menu { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.epod-menu-item { border-radius: 12px; padding: 12px 12px 10px; border: 2px solid; position: relative; overflow: hidden; }
+.epod-menu-item .mi-icon { font-size: 22px; line-height: 1; margin-bottom: 6px; display: block; }
+.epod-menu-item .label { font-size: 13px; font-weight: 500; margin: 0 0 1px; font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.5px; }
+.epod-menu-item .count { font-size: 11px; margin: 0; font-family: var(--font-mono); letter-spacing: 0.5px; }
+.epod-menu-item .deco { position: absolute; top: 8px; right: 8px; opacity: 0.55; }
+.epod-c1 { background: rgba(255, 59, 140, 0.18); border-color: #ff3b8c; }
+.epod-c1 .mi-icon, .epod-c1 .label { color: #ff3b8c; } .epod-c1 .count { color: #ffb3d1; }
+.epod-c2 { background: rgba(0, 229, 208, 0.14); border-color: #00e5d0; }
+.epod-c2 .mi-icon, .epod-c2 .label { color: #00e5d0; } .epod-c2 .count { color: #8ee8de; }
+.epod-c3 { background: rgba(255, 214, 10, 0.14); border-color: #ffd60a; }
+.epod-c3 .mi-icon, .epod-c3 .label { color: #ffd60a; } .epod-c3 .count { color: #f0e09a; }
+.epod-c4 { background: rgba(165, 116, 237, 0.18); border-color: #a574ed; }
+.epod-c4 .mi-icon, .epod-c4 .label { color: #a574ed; } .epod-c4 .count { color: #d4baff; }
+</style>
+<h2 class="sr-only">EgePod main menu mockup in a 90s Memphis-design style: the green-suited mascot is the phone wallpaper, with an LCD-style now-playing readout, chunky transport buttons, and four color-blocked library tiles.</h2>
+<div class="epod-stage">
+  <div class="epod-phone">
+    <div class="epod-screen">
+      <div class="epod-overlay"></div>
+      <div class="epod-content">
+        <div class="epod-status">
+          <span>09:41</span>
+          <span>▮▮▮▮▯ 87%</span>
+        </div>
+        <div class="epod-header">
+          <div class="epod-logo">EGE<span class="pink">·POD</span></div>
+          <div class="epod-search" aria-label="Search"><i class="ti ti-search" aria-hidden="true"></i></div>
+        </div>
+        <div class="epod-memphis">
+          <div class="epod-m1"></div><div class="epod-m2"></div><div class="epod-m3"></div><div class="epod-m4"></div><div class="epod-m5"></div>
+        </div>
+        <div class="epod-lcd">
+          <div class="epod-lcd-label">▶ NOW PLAYING</div>
+          <div class="epod-lcd-track">
+            <span class="epod-lcd-title">MONEY MOVES</span>
+            <span class="epod-lcd-time">1:23</span>
+          </div>
+          <div class="epod-lcd-artist">GREEN SUIT — PINSTRIPE LP</div>
+          <div class="epod-eq">
+            <div class="epod-eq-bar" style="height:55%"></div>
+            <div class="epod-eq-bar alt" style="height:80%"></div>
+            <div class="epod-eq-bar" style="height:40%"></div>
+            <div class="epod-eq-bar alt" style="height:70%"></div>
+            <div class="epod-eq-bar" style="height:95%"></div>
+            <div class="epod-eq-bar alt" style="height:55%"></div>
+            <div class="epod-eq-bar" style="height:75%"></div>
+            <div class="epod-eq-bar alt" style="height:35%"></div>
+            <div class="epod-eq-bar" style="height:65%"></div>
+            <div class="epod-eq-bar alt" style="height:85%"></div>
+            <div class="epod-eq-bar" style="height:45%"></div>
+            <div class="epod-eq-bar alt" style="height:60%"></div>
+            <div class="epod-eq-bar" style="height:80%"></div>
+            <div class="epod-eq-bar alt" style="height:50%"></div>
+          </div>
+        </div>
+        <div class="epod-controls">
+          <button class="epod-btn" aria-label="Shuffle"><i class="ti ti-arrows-shuffle" aria-hidden="true"></i></button>
+          <button class="epod-btn" aria-label="Previous"><i class="ti ti-player-skip-back" aria-hidden="true"></i></button>
+          <button class="epod-btn play" aria-label="Play"><i class="ti ti-player-play" aria-hidden="true"></i></button>
+          <button class="epod-btn" aria-label="Next"><i class="ti ti-player-skip-forward" aria-hidden="true"></i></button>
+          <button class="epod-btn" aria-label="Repeat"><i class="ti ti-repeat" aria-hidden="true"></i></button>
+        </div>
+        <div class="epod-section-label">LIBRARY</div>
+        <div class="epod-menu">
+          <div class="epod-menu-item epod-c1">
+            <svg class="deco" width="22" height="14" viewBox="0 0 22 14" aria-hidden="true"><path d="M1 7 Q4 1 7 7 T13 7 T19 7" stroke="#ff3b8c" stroke-width="1.5" fill="none"/></svg>
+            <i class="ti ti-music mi-icon" aria-hidden="true"></i>
+            <p class="label">Songs</p>
+            <p class="count">412 tracks</p>
+          </div>
+          <div class="epod-menu-item epod-c2">
+            <svg class="deco" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><circle cx="4" cy="4" r="2" fill="#00e5d0"/><circle cx="14" cy="4" r="2" fill="#00e5d0"/><circle cx="4" cy="14" r="2" fill="#00e5d0"/><circle cx="14" cy="14" r="2" fill="#00e5d0"/></svg>
+            <i class="ti ti-disc mi-icon" aria-hidden="true"></i>
+            <p class="label">Albums</p>
+            <p class="count">38 albums</p>
+          </div>
+          <div class="epod-menu-item epod-c3">
+            <svg class="deco" width="22" height="14" viewBox="0 0 22 14" aria-hidden="true"><path d="M1 13 L5 3 L9 13 L13 3 L17 13 L21 3" stroke="#ffd60a" stroke-width="1.5" fill="none"/></svg>
+            <i class="ti ti-microphone-2 mi-icon" aria-hidden="true"></i>
+            <p class="label">Artists</p>
+            <p class="count">52 artists</p>
+          </div>
+          <div class="epod-menu-item epod-c4">
+            <svg class="deco" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><polygon points="9,2 16,15 2,15" fill="none" stroke="#a574ed" stroke-width="1.5"/></svg>
+            <i class="ti ti-playlist mi-icon" aria-hidden="true"></i>
+            <p class="label">Mixtapes</p>
+            <p class="count">14 lists</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
