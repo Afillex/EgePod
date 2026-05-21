@@ -86,9 +86,12 @@ int main(void)
     cpu_apply_dap_policy();
     rfkill_block_all();
 
-    /* Signal readiness to init */
+    /* Signal readiness to init (path matches init.rc wait command). */
+#ifndef EGEPOD_READY_DIR
+# define EGEPOD_READY_DIR "/tmp"
+#endif
     {
-        FILE *f = fopen("/tmp/egepod_pwrd_ready", "w");
+        FILE *f = fopen(EGEPOD_READY_DIR "/egepod_pwrd_ready", "w");
         if (f) { fputs("1\n", f); fclose(f); }
     }
 

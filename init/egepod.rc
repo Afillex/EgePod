@@ -1,55 +1,71 @@
-# Android init language service definitions for EgePod DAP OS.
-# Place in /system/etc/init/egepod.rc
-# Init reads this after the primary init.rc; services start on boot.
+# EgePod DAP OS — Android init service definitions
+# Place at: /system/etc/init/egepod.rc
+#
+# Requires a rooted device with SELinux permissive (set by flash.sh).
+# Music must be placed in /sdcard/Music (vold mounts this during boot).
+#
+# Boot sequence:
+#   1. Android boots normally through sys.boot_completed=1
+#   2. This file stops conflicting Android services
+#   3. EgePod daemons start in order: pwrd → audiod → uid
 
-# ── Power daemon ─────────────────────────────────────────────────────────────
-# Must be the first service started. Applies CPU hotplug and rfkill policy
-# before audiod and uid touch any hardware.
+# ── Stop the Android stack on boot-complete ───────────────────────────────────
+on property:sys.boot_completed=1
+    # audioserver / media hold the ALSA PCM device — must die before audiod opens it
+    stop audioserver
+    stop media
+    stop mediaextractor
+    stop mediadrmserver
+    # Vendor audio HAL (service name varies by Android version)
+    stop android.hardware.audio.service
+    stop vendor.mediatek.hardware.audio@7.0-service
+    # Android UI stack — not needed for a headless DAP
+    stop zygote
+    stop zygote_secondary
+    stop surfaceflinger
+    stop vendor.gralloc-2-0
+    # Start EgePod in order
+    start egepod_pwrd
+    wait /dev/egepod_pwrd_ready 10
+    start egepod_audiod
+    wait /dev/egepod_audiod_ready 15
+    start egepod_uid
+
+# ── Power & policy daemon ─────────────────────────────────────────────────────
+# Runs first: applies CPU hotplug (A76 offline), rfkill, governor.
+# oneshot — policy writes are idempotent; no need to restart on exit.
 service egepod_pwrd /system/bin/egepod_pwrd
-    class main
-    user root            # needs sysfs/rfkill write access
-    group system
-    oneshot              # policy writes are idempotent; no need to restart
-    seclabel u:r:egepod:s0
+    user root
+    group root
+    disabled
+    oneshot
+    seclabel u:r:su:s0
     writepid /dev/cpuset/system/tasks
 
-# Wait for pwrd to signal readiness before starting audio and UI.
-wait /tmp/egepod_pwrd_ready 5
-
 # ── Audio daemon ──────────────────────────────────────────────────────────────
+# Opens /dev/snd/pcmC0D0p via tinyalsa directly (no AudioFlinger).
+# Scans /sdcard/Music, decodes FLAC/WAV/MP3, serves IPC over Unix socket.
 service egepod_audiod /system/bin/egepod_audiod
-    class main
-    user system
-    group system sdcard_r audio
-    socket egepod_audiod seqpacket 0660 system system
-    restart_on_failure restart
-    seclabel u:r:egepod:s0
+    user root
+    group root audio
+    disabled
+    seclabel u:r:su:s0
     writepid /dev/cpuset/audio-app/tasks
 
-wait /tmp/egepod_audiod_ready 10
-
 # ── UI daemon ─────────────────────────────────────────────────────────────────
+# Draws to /dev/fb0 (framebuffer), reads /dev/input/event* for touch/keys.
 service egepod_uid /system/bin/egepod_uid
-    class main
-    user system
-    group system graphics input
-    restart_on_failure restart
-    seclabel u:r:egepod:s0
+    user root
+    group root graphics input
+    disabled
+    setenv EGEPOD_FONT_PATH /system/fonts/Roboto-Bold.ttf
+    seclabel u:r:su:s0
     writepid /dev/cpuset/foreground/tasks
 
-# ── Disable stock services we don't need ─────────────────────────────────────
-# Comment these out if you need ADB.
-# stop surfaceflinger
-# stop audioserver
-# stop mediaserver
-# stop wificond
-# stop bluetooth
-
+# ── Hardware / cpuset setup ───────────────────────────────────────────────────
 on boot
-    # Lock the audio CPU (cpu1) to the audio cpuset so the kernel scheduler
-    # cannot migrate the SCHED_FIFO playback thread.
+    # Allow audio thread (SCHED_FIFO, CPU1) to use all A55 cores
     write /dev/cpuset/audio-app/cpus 0-5
     write /dev/cpuset/audio-app/mems 0
-
-    # Disable kernel audit noise in logs
+    # Reduce kernel audit log spam
     write /proc/sys/kernel/printk "3 4 1 3"

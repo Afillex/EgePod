@@ -104,8 +104,15 @@ static stbtt_fontinfo  g_font;
 static int             g_font_ok  = 0;
 static unsigned char  *g_font_buf = NULL;
 
-/* Priority list — Nimbus Sans Bold is metrically identical to Helvetica. */
+/* Priority list — Nimbus Sans Bold is metrically identical to Helvetica.
+ * Android paths come first so the production binary finds a font quickly. */
 static const char *FONT_PATHS[] = {
+    /* Android system fonts (Redmi Note 10S / MIUI / AOSP) */
+    "/system/fonts/Roboto-Bold.ttf",
+    "/system/fonts/NotoSans-Bold.ttf",
+    "/system/fonts/DroidSans-Bold.ttf",
+    "/system/fonts/Helvetica.ttf",
+    /* Linux simulation (OrbStack Ubuntu VM) */
     "/usr/share/fonts/opentype/urw-base35/NimbusSans-Bold.otf",
     "/usr/share/fonts/opentype/urw-base35/NimbusSansCond-Bold.otf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -113,6 +120,7 @@ static const char *FONT_PATHS[] = {
     "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    /* macOS fallback */
     "/System/Library/Fonts/Helvetica.ttc",
     NULL
 };

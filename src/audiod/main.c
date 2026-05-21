@@ -73,9 +73,14 @@ int main(void)
     Player *player = player_create(index);
     if (!player) { LOGE("audiod: player_create failed"); return 1; }
 
-    /* Notify init that the service is ready */
+    /* Notify init that the service is ready.
+     * On Android production EGEPOD_READY_DIR=/dev (writeable by root).
+     * On simulation it stays /tmp (default). */
+#ifndef EGEPOD_READY_DIR
+# define EGEPOD_READY_DIR "/tmp"
+#endif
     {
-        FILE *f = fopen("/tmp/egepod_audiod_ready", "w");
+        FILE *f = fopen(EGEPOD_READY_DIR "/egepod_audiod_ready", "w");
         if (f) { fputs("1\n", f); fclose(f); }
     }
 
