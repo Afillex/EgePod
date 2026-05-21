@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <time.h>
 
 /* ── forward declarations from ipc_client.c ─────────────────────────────── */
@@ -73,6 +74,7 @@ static void progress_timer_disarm(void)
 static int            g_lib_fetch_idx = -1;  /* next track idx to fetch; -1 = done */
 static pthread_t      g_render_tid;
 static sem_t          g_render_sem;     /* posted when a new frame is needed */
+static atomic_flag    g_redraw_pending = ATOMIC_FLAG_INIT;
 static FbCtx          g_fb;
 static UiState        g_ui;            /* written by main thread, read by render */
 static pthread_mutex_t g_ui_lock       = PTHREAD_MUTEX_INITIALIZER;
@@ -90,6 +92,10 @@ static void *render_thread(void *arg)
         sem_wait(&g_render_sem);
         if (g_quit) break;
 
+        /* Clear the coalescing flag BEFORE snapshotting state so any new
+         * request_redraw() arriving during this frame queues a follow-up. */
+        atomic_flag_clear(&g_redraw_pending);
+
         pthread_mutex_lock(&g_ui_lock);
         UiState snap = g_ui;
         pthread_mutex_unlock(&g_ui_lock);
@@ -102,10 +108,11 @@ static void *render_thread(void *arg)
 
 static void request_redraw(void)
 {
-    /* Drop duplicate redraws if the render thread is already queued */
-    int v = 0;
-    sem_getvalue(&g_render_sem, &v);
-    if (v == 0) sem_post(&g_render_sem);
+    /* atomic test-and-set: only the first caller to flip 0→1 posts the
+     * semaphore. Subsequent callers (e.g., position event + timer firing
+     * in the same epoll wakeup) are coalesced into a single frame. */
+    if (!atomic_flag_test_and_set(&g_redraw_pending))
+        sem_post(&g_render_sem);
 }
 
 static void screen_off(void)
@@ -113,6 +120,8 @@ static void screen_off(void)
     if (!g_screen_on) return;
     g_screen_on = 0;
     fb_set_brightness(0);
+    /* Stop 20 Hz redraw wakeups so the SoC can stay in deep sleep. */
+    progress_timer_disarm();
     /* render thread stays blocked at sem_wait — no SIGSTOP needed */
     LOGI("uid: screen off");
 }
@@ -122,6 +131,11 @@ static void screen_on(void)
     if (g_screen_on) return;
     g_screen_on = 1;
     fb_set_brightness(200);
+    /* Re-arm progress redraws only if audio is currently playing. */
+    pthread_mutex_lock(&g_ui_lock);
+    PlayerState s = g_ui.state;
+    pthread_mutex_unlock(&g_ui_lock);
+    if (s == PLAYER_PLAYING) progress_timer_arm();
     request_redraw();
     LOGI("uid: screen on");
 }
@@ -250,16 +264,25 @@ int main(void)
                         break;
                     }
                     case EVT_TRACK:
-                        g_ui.track         = msg.param.track;
-                        g_ui.position_ms   = 0;
-                        g_ui.cur_track_idx = msg.seq;
+                        g_ui.track           = msg.param.track;
+                        g_ui.position_ms     = 0;
+                        /* Reset anchor — otherwise interpolation would
+                         * extrapolate from the previous track's last update. */
+                        g_ui.pos_ref_mono_ms = mono_ms();
+                        g_ui.cur_track_idx   = msg.seq;
                         break;
                     case EVT_STATE:
                         g_ui.state = msg.param.player_state;
-                        if (msg.param.player_state == PLAYER_PLAYING)
+                        if (msg.param.player_state == PLAYER_PLAYING) {
+                            /* Re-anchor on transition into PLAYING so the bar
+                             * doesn't jump forward using a stale delta from
+                             * before the pause. audiod's next EVT_POSITION
+                             * (≤200 ms away) refines this. */
+                            g_ui.pos_ref_mono_ms = mono_ms();
                             progress_timer_arm();
-                        else
+                        } else {
                             progress_timer_disarm();
+                        }
                         break;
                     case EVT_POSITION:
                         g_ui.position_ms      = msg.param.position_ms;
@@ -365,9 +388,15 @@ int main(void)
                             int x = tap_x;
                             if (x >= UI_BTN_PREV_X && x < UI_BTN_PREV_X + UI_BTN_PREV_W)
                                 ipc_send_cmd(audiod_fd, CMD_PREV, 0);
-                            else if (x >= UI_BTN_PLAY_X && x < UI_BTN_PLAY_X + UI_BTN_PLAY_W)
+                            else if (x >= UI_BTN_PLAY_X && x < UI_BTN_PLAY_X + UI_BTN_PLAY_W) {
+                                /* Race-safe read of player state: render thread
+                                 * writes the same field under g_ui_lock. */
+                                pthread_mutex_lock(&g_ui_lock);
+                                PlayerState ps = g_ui.state;
+                                pthread_mutex_unlock(&g_ui_lock);
                                 ipc_send_cmd(audiod_fd,
-                                    g_ui.state == PLAYER_PLAYING ? CMD_PAUSE : CMD_PLAY, 0);
+                                    ps == PLAYER_PLAYING ? CMD_PAUSE : CMD_PLAY, 0);
+                            }
                             else if (x >= UI_BTN_NEXT_X && x < UI_BTN_NEXT_X + UI_BTN_NEXT_W)
                                 ipc_send_cmd(audiod_fd, CMD_NEXT, 0);
                         }
