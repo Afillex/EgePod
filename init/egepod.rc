@@ -1,13 +1,17 @@
 # EgePod DAP OS — Android init service definitions
 # Place at: /system/etc/init/egepod.rc
 #
-# Requires a rooted device with SELinux permissive (set by flash.sh).
+# SELinux is disabled at early-init so it stays off across reboots.
 # Music must be placed in /sdcard/Music (vold mounts this during boot).
 #
 # Boot sequence:
-#   1. Android boots normally through sys.boot_completed=1
-#   2. This file stops conflicting Android services
-#   3. EgePod daemons start in order: pwrd → audiod → uid
+#   1. SELinux disabled at early-init (persists across reboots)
+#   2. Android boots normally through sys.boot_completed=1
+#   3. This file stops conflicting Android services
+#   4. EgePod daemons start in order: pwrd → audiod → uid
+
+on early-init
+    write /sys/fs/selinux/enforce 0
 
 # ── Stop the Android stack on boot-complete ───────────────────────────────────
 on property:sys.boot_completed=1
@@ -33,12 +37,11 @@ on property:sys.boot_completed=1
 
 # ── Power & policy daemon ─────────────────────────────────────────────────────
 # Runs first: applies CPU hotplug (A76 offline), rfkill, governor.
-# oneshot — policy writes are idempotent; no need to restart on exit.
+# No oneshot — init will restart it if it crashes; audiod/uid depend on its socket.
 service egepod_pwrd /system/bin/egepod_pwrd
     user root
     group root
     disabled
-    oneshot
     seclabel u:r:su:s0
     writepid /dev/cpuset/system/tasks
 

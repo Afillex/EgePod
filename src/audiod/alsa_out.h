@@ -23,3 +23,8 @@ void alsa_out_close(AlsaOut *out);
 /* Pause/resume without closing (avoids codec re-init overhead). */
 int alsa_out_pause(AlsaOut *out);
 int alsa_out_resume(AlsaOut *out);
+
+/* Returns 1 if the open device matches rate/channels; 0 if it needs to be
+ * reopened (e.g. the next track has a different sample rate). */
+int alsa_out_matches_format(const AlsaOut *out, unsigned int rate,
+                            unsigned int channels);

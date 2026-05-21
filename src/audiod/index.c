@@ -6,6 +6,15 @@
 #include <stdio.h>
 #include <sys/stat.h>
 
+static int node_cmp(const void *a, const void *b)
+{
+    const IndexNode *na = *(const IndexNode *const *)a;
+    const IndexNode *nb = *(const IndexNode *const *)b;
+    /* Directories sort before files, then alphabetically by name. */
+    if (na->is_dir != nb->is_dir) return nb->is_dir - na->is_dir;
+    return strcasecmp(na->name, nb->name);
+}
+
 /* ── helpers ───────────────────────────────────────────────────────────── */
 
 static const char *file_ext(const char *name)
@@ -105,6 +114,11 @@ static void scan_dir(IndexNode *dir_node, const char *path)
         }
     }
     closedir(dp);
+
+    /* Sort children so library view is alphabetical regardless of eMMC layout. */
+    if (dir_node->child_count > 1)
+        qsort(dir_node->children, dir_node->child_count,
+              sizeof(IndexNode *), node_cmp);
 }
 
 /* ── public API ────────────────────────────────────────────────────────── */

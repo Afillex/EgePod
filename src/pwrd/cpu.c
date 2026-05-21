@@ -87,9 +87,9 @@ int cpu_apply_dap_policy(void)
         if (sysfs_write(path, "400000")  != 0) errors++;   /* 400 MHz floor */
     }
 
-    /* 3. GPU: disable clocking (Mali-G76) */
+    /* 3. GPU: disable clocking (Mali-G76 on MT6785).
+     * kgsl is Qualcomm/Adreno — wrong GPU vendor.  Mali path only. */
     sysfs_write("/sys/class/misc/mali0/device/power_policy",  "always_off");
-    sysfs_write("/sys/class/kgsl/kgsl-3d0/pwrctrl/gpuclk",    "0");
 
     /* 4. Scheduler: hint cores that the workload is mostly idle */
     sysfs_write("/proc/sys/kernel/sched_energy_aware", "1");
@@ -101,9 +101,13 @@ int cpu_apply_dap_policy(void)
     sysfs_write("/proc/sys/vm/dirty_writeback_centisecs", "6000");
     sysfs_write("/proc/sys/vm/dirty_expire_centisecs",    "12000");
 
-    /* 7. Transparent hugepages: disable to prevent background compaction wakeups */
-    sysfs_write("/sys/kernel/mm/transparent_hugepage/enabled", "never");
-    sysfs_write("/sys/kernel/mm/transparent_hugepage/defrag",  "never");
+    /* 7. Transparent hugepages: madvise mode — only allocate huge pages when
+     * the caller opts in with madvise(MADV_HUGEPAGE).  Decoder does this for
+     * the ~30 MB mlock'd PCM buffer, reducing TLB pressure during playback.
+     * "never" would disable THP entirely, wasting the kernel config option.
+     * "always" causes background compaction wakeups — not wanted for DAP. */
+    sysfs_write("/sys/kernel/mm/transparent_hugepage/enabled", "madvise");
+    sysfs_write("/sys/kernel/mm/transparent_hugepage/defrag",  "defer+madvise");
 
     /* 8. eMMC I/O scheduler: no-op removes periodic elevator timer wakeups */
     sysfs_write("/sys/block/mmcblk0/queue/scheduler", "none");
@@ -125,27 +129,28 @@ void cpu_restore_defaults(void)
     sysfs_write("/sys/devices/system/cpu/cpu6/online", "1");
     sysfs_write("/sys/devices/system/cpu/cpu7/online", "1");
 
-    const char *a55_cores[] = {"cpu0","cpu1","cpu2","cpu3","cpu4","cpu5","cpu6","cpu7"};
-    for (size_t i = 0; i < sizeof(a55_cores)/sizeof(a55_cores[0]); i++) {
+    const char *all_cores[] = {"cpu0","cpu1","cpu2","cpu3","cpu4","cpu5","cpu6","cpu7"};
+    for (size_t i = 0; i < sizeof(all_cores)/sizeof(all_cores[0]); i++) {
         char path[128];
         snprintf(path, sizeof(path),
-                 "/sys/devices/system/cpu/%s/cpufreq/scaling_governor", a55_cores[i]);
+                 "/sys/devices/system/cpu/%s/cpufreq/scaling_governor", all_cores[i]);
         sysfs_write(path, "schedutil");
+
+        /* Restore frequency limits to hardware maximums so the device is not
+         * permanently throttled after EgePod exits. */
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/%s/cpufreq/scaling_max_freq", all_cores[i]);
+        sysfs_write(path, "2000000");   /* A55 max 2.0 GHz */
+
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/%s/cpufreq/scaling_min_freq", all_cores[i]);
+        sysfs_write(path, "500000");    /* Android default floor */
     }
     sysfs_write("/sys/class/misc/mali0/device/power_policy", "demand");
     sysfs_write("/sys/kernel/mm/transparent_hugepage/enabled", "madvise");
     sysfs_write("/proc/sys/kernel/timer_migration", "1");
+    sysfs_write("/proc/sys/vm/swappiness", "100");
+    sysfs_write("/proc/sys/vm/dirty_writeback_centisecs", "500");
+    sysfs_write("/proc/sys/vm/dirty_expire_centisecs",    "3000");
     LOGI("pwrd: default CPU policy restored");
-}
-
-int cpu_read_power_mA(uint32_t *out_mA)
-{
-    /* Read from powercap RAPL-style sysfs if available on this platform.
-     * MT6785 does not expose RAPL; this is a best-effort path. */
-    uint32_t uw = 0;
-    int rc = sysfs_read_u32(
-        "/sys/class/power_supply/battery/current_now", &uw);
-    if (rc == 0)
-        *out_mA = uw / 1000;   /* µA → mA */
-    return rc;
 }

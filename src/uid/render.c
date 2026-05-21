@@ -291,6 +291,10 @@ static void draw_vinyl(uint32_t *buf, uint32_t stride,
     const int label_r  = VINYL_LBL_R;
     const int hub_r    = VINYL_HUB_R;
     const int gp       = 9;   /* groove pitch in pixels */
+    /* Precompute squared thresholds — avoids sqrtf for hub and label pixels
+     * (~6% of the disc area) and keeps the hot path branch-free. */
+    const int hub_r2   = hub_r   * hub_r;
+    const int label_r2 = label_r * label_r;
 
     for (int dy = -outer_r; dy <= outer_r; dy++) {
         int py = cy + dy;
@@ -300,11 +304,17 @@ static void draw_vinyl(uint32_t *buf, uint32_t stride,
         for (int dx = -span; dx <= span; dx++) {
             int px = cx + dx;
             if (px < 0 || px >= W_FB) continue;
-            int r = (int)sqrtf((float)(dx*dx + dy*dy));
+            int dist2 = dx*dx + dy*dy;
             uint32_t c;
-            if      (r <= hub_r)   c = C_VINYL_HUB;
-            else if (r <= label_r) c = C_VINYL_LBL;
-            else                   c = ((r / gp) & 1) ? C_VINYL_B : C_VINYL_A;
+            if (dist2 <= hub_r2) {
+                c = C_VINYL_HUB;
+            } else if (dist2 <= label_r2) {
+                c = C_VINYL_LBL;
+            } else {
+                /* sqrtf only needed for groove-band index; unavoidable here. */
+                int r = (int)sqrtf((float)dist2);
+                c = ((r / gp) & 1) ? C_VINYL_B : C_VINYL_A;
+            }
             row[px] = c;
         }
     }
@@ -506,16 +516,18 @@ void render_frame(FbCtx *fb, const UiState *st)
 {
     font_init();
 
-    uint32_t *buf    = fb_back(fb);
-    uint32_t  stride = fb->stride / sizeof(uint32_t);
+    /* All drawing targets a fixed 720×1280 virtual canvas.  At the end of
+     * this function the canvas is scale-blitted to the actual framebuffer
+     * (1080×2400 on Redmi Note 10S) so no layout constant needs to know
+     * the physical display size. */
+    static uint32_t vbuf[W_FB * H_FB];
+    const uint32_t  stride = W_FB;
+    uint32_t       *buf    = vbuf;
+    for (size_t _vi = 0; _vi < W_FB * H_FB; _vi++) vbuf[_vi] = C_BG;
 
     if (st->lib_mode) {
         render_library(buf, stride, st);
-        return;
-    }
-
-    /* ── Background ── */
-    fb_clear(fb, C_BG);
+    } else {
 
     /* ── Status bar ── */
     {
@@ -701,5 +713,27 @@ void render_frame(FbCtx *fb, const UiState *st)
         int bdot_x = UI_BRIGHT_X +
                      (int)((uint64_t)st->brightness * (uint64_t)UI_BRIGHT_W / 100);
         buf_fill_circle(buf, stride, W_FB, H_FB, bdot_x, bar_cy, 5, C_TEXT_2);
+    }
+    } /* end else (player view) */
+
+    /* Scale-blit: nearest-neighbour upscale from W_FB×H_FB to actual display.
+     * On the Redmi Note 10S (1080×2400) this expands the 720×1280 canvas 1.5×
+     * horizontally and 1.875× vertically, filling the full screen. */
+    {
+        uint32_t *dst     = fb_back(fb);
+        uint32_t  dstride = fb->stride / sizeof(uint32_t);
+        uint32_t  dw = fb->width, dh = fb->height;
+        if (dw == W_FB && dh == H_FB) {
+            /* Simulation (1:1) — memcpy is much faster than the scaling loop */
+            memcpy(dst, vbuf, sizeof(vbuf));
+        } else {
+            for (uint32_t dy = 0; dy < dh; dy++) {
+                uint32_t sy = dy * H_FB / dh;
+                uint32_t *drow = dst + (size_t)dy * dstride;
+                const uint32_t *srow = vbuf + (size_t)sy * W_FB;
+                for (uint32_t dx = 0; dx < dw; dx++)
+                    drow[dx] = srow[dx * W_FB / dw];
+            }
+        }
     }
 }

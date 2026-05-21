@@ -32,7 +32,6 @@
 #define BRIGHTNESS_ON          "200"
 #define BRIGHTNESS_OFF         "0"
 #define BATTERY_CAPACITY_PATH  "/sys/class/power_supply/battery/capacity"
-#define BATTERY_CURRENT_PATH   "/sys/class/power_supply/battery/current_now"
 #define THERMAL_PATH           "/sys/class/thermal/thermal_zone0/temp"
 
 static volatile int g_quit = 0;
@@ -117,7 +116,8 @@ int main(void)
     }
 
     int    client_fd = -1;
-    uint32_t last_batt = 0xFF;
+    uint32_t last_batt    = 0xFF;
+    int      thermal_warn = 0;   /* 1 while above threshold (hysteresis gate) */
 
     struct epoll_event events[4];
 
@@ -135,7 +135,12 @@ int main(void)
             if (fd == srv_fd) {
                 int cfd = accept4(srv_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
                 if (cfd < 0) continue;
-                if (client_fd >= 0) close(client_fd); /* only one UI client */
+                if (client_fd >= 0) {
+                    /* Remove the old fd from epoll BEFORE closing it — otherwise
+                     * the closed fd stays in the epoll set and triggers a busy loop. */
+                    epoll_ctl(ep, EPOLL_CTL_DEL, client_fd, NULL);
+                    close(client_fd);
+                }
                 client_fd = cfd;
                 ev.events = EPOLLIN | EPOLLHUP | EPOLLERR;
                 ev.data.fd = cfd;
@@ -158,14 +163,21 @@ int main(void)
                     last_batt = pct;
                 }
 
-                /* Thermal */
+                /* Thermal — send event only on rising edge (hysteresis: re-arm
+                 * only after temperature drops 3°C below the threshold). */
                 uint32_t temp_mc = 0;
                 if (sysfs_read_u32(THERMAL_PATH, &temp_mc) == 0) {
                     uint32_t temp_c = temp_mc / 1000;
-                    if (temp_c >= THERMAL_WARN_CELSIUS && client_fd >= 0) {
-                        IpcMsg m = { .type = EVT_THERMAL };
-                        m.param.temp_celsius_x10 = temp_mc / 100;
-                        send(client_fd, &m, sizeof(m), MSG_DONTWAIT);
+                    if (!thermal_warn && temp_c >= THERMAL_WARN_CELSIUS) {
+                        thermal_warn = 1;
+                        if (client_fd >= 0) {
+                            IpcMsg m = { .type = EVT_THERMAL };
+                            m.param.temp_celsius_x10 = temp_mc / 100;
+                            send(client_fd, &m, sizeof(m), MSG_DONTWAIT);
+                        }
+                        LOGW("pwrd: thermal warning: %u °C", temp_c);
+                    } else if (thermal_warn && temp_c < THERMAL_WARN_CELSIUS - 3) {
+                        thermal_warn = 0;   /* re-arm after cooling */
                     }
                 }
                 continue;

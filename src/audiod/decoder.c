@@ -52,25 +52,52 @@ static uint8_t *slurp_file(const char *path, size_t *size_out)
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return NULL; }
 
-    uint8_t *buf = malloc(st.st_size);
+    uint8_t *buf = malloc((size_t)st.st_size);
     if (!buf) { close(fd); return NULL; }
 
-    ssize_t rd = read(fd, buf, st.st_size);
-    close(fd);
-
-    if (rd != st.st_size) {
-        LOGE("decoder: short read on %s (%zd / %lld)", path, rd, (long long)st.st_size);
-        free(buf);
-        return NULL;
+    /* Use a loop — a single read() may return fewer bytes than requested
+     * if interrupted by a signal or due to I/O scheduling. */
+    size_t total = 0;
+    while (total < (size_t)st.st_size) {
+        ssize_t n = read(fd, buf + total, (size_t)st.st_size - total);
+        if (n <= 0) {
+            LOGE("decoder: read error on %s at %zu/%lld: %s",
+                 path, total, (long long)st.st_size, strerror(errno));
+            free(buf);
+            close(fd);
+            return NULL;
+        }
+        total += (size_t)n;
     }
-    *size_out = (size_t)st.st_size;
+    close(fd);
+    *size_out = total;
     return buf;
 }
 
-/* Allocate a locked anonymous mapping for PCM output. */
+/* Hard cap: 256 MB per track.  At 16-bit/96kHz/2ch that is ~22 minutes.
+ * Beyond this, mlock would silently fail and the buffer risks being swapped,
+ * causing audio dropouts under memory pressure. */
+#define PCM_MAX_BYTES (256UL * 1024UL * 1024UL)
+
+/* Allocate a locked anonymous mapping for PCM output.
+ * MADV_HUGEPAGE reduces TLB pressure on the large PCM buffer (requires
+ * CONFIG_TRANSPARENT_HUGEPAGE=madvise, set by cpu_apply_dap_policy). */
 static int16_t *alloc_pcm(size_t n_frames, uint32_t channels)
 {
-    size_t bytes = n_frames * channels * sizeof(int16_t);
+    if (channels == 0 || channels > 8) {
+        LOGE("decoder: alloc_pcm: invalid channels=%u", channels);
+        return NULL;
+    }
+    /* Check for overflow BEFORE multiplying: n_frames * channels * 2 can wrap
+     * on a malformed file with a huge frame count, bypassing the cap below. */
+    if (n_frames == 0 ||
+        n_frames > PCM_MAX_BYTES / ((size_t)channels * sizeof(int16_t))) {
+        LOGE("decoder: alloc_pcm: %zu frames × %u ch zero or exceeds 256 MB cap",
+             n_frames, channels);
+        return NULL;
+    }
+    size_t bytes = n_frames * (size_t)channels * sizeof(int16_t);
+
     void *p = mmap(NULL, bytes,
                    PROT_READ | PROT_WRITE,
                    MAP_ANONYMOUS | MAP_PRIVATE,
@@ -79,8 +106,11 @@ static int16_t *alloc_pcm(size_t n_frames, uint32_t channels)
         LOGE("decoder: mmap(%zu): %s", bytes, strerror(errno));
         return NULL;
     }
+    /* Hint the kernel to back this mapping with huge pages — reduces TLB
+     * misses on a ~30 MB PCM buffer.  Silent no-op if hugepages unavailable. */
+    madvise(p, bytes, MADV_HUGEPAGE);
     if (mlock(p, bytes) != 0)
-        LOGW("decoder: mlock failed (%s) — swap possible under memory pressure",
+        LOGW("decoder: mlock failed (%s) — PCM may be swapped under pressure",
              strerror(errno));
     return (int16_t *)p;
 }
@@ -91,25 +121,32 @@ static int decode_flac(const uint8_t *data, size_t data_len,
                        int16_t **pcm_out, size_t *frames_out,
                        uint32_t *rate_out, uint32_t *channels_out)
 {
-    drflac_uint64 frame_count;
-    unsigned int  channels, rate;
+    /* Open without decoding to read the header metadata first. */
+    drflac *f = drflac_open_memory(data, data_len, NULL);
+    if (!f) { LOGE("decoder: FLAC open failed"); return -1; }
 
-    /* dr_flac decodes to int16 from memory buffer */
-    int16_t *decoded = drflac_open_memory_and_read_pcm_frames_s16(
-                           data, data_len, &channels, &rate, &frame_count, NULL);
-    if (!decoded) { LOGE("decoder: FLAC decode failed"); return -1; }
+    size_t   n  = (size_t)f->totalPCMFrameCount;
+    uint32_t ch = f->channels;
+    uint32_t sr = f->sampleRate;
 
-    size_t bytes = (size_t)frame_count * channels * sizeof(int16_t);
-    int16_t *locked = alloc_pcm((size_t)frame_count, channels);
-    if (!locked) { drflac_free(decoded, NULL); return -1; }
+    /* Allocate the locked mmap buffer, then decode directly into it —
+     * avoids a second ~30 MB heap allocation and memcpy. */
+    int16_t *locked = alloc_pcm(n, ch);
+    if (!locked) { drflac_close(f); return -1; }
 
-    memcpy(locked, decoded, bytes);
-    drflac_free(decoded, NULL);
+    drflac_uint64 decoded = drflac_read_pcm_frames_s16(f, (drflac_uint64)n, locked);
+    drflac_close(f);
+
+    if (decoded == 0) {
+        LOGE("decoder: FLAC decode produced 0 frames");
+        decoder_free(locked, n, ch);
+        return -1;
+    }
 
     *pcm_out      = locked;
-    *frames_out   = (size_t)frame_count;
-    *rate_out     = rate;
-    *channels_out = channels;
+    *frames_out   = (size_t)decoded;
+    *rate_out     = sr;
+    *channels_out = ch;
     return 0;
 }
 
@@ -119,24 +156,32 @@ static int decode_wav(const uint8_t *data, size_t data_len,
                       int16_t **pcm_out, size_t *frames_out,
                       uint32_t *rate_out, uint32_t *channels_out)
 {
-    drwav_uint64  frame_count;
-    unsigned int  channels, rate;
+    drwav w;
+    if (!drwav_init_memory(&w, data, data_len, NULL)) {
+        LOGE("decoder: WAV open failed");
+        return -1;
+    }
 
-    int16_t *decoded = drwav_open_memory_and_read_pcm_frames_s16(
-                           data, data_len, &channels, &rate, &frame_count, NULL);
-    if (!decoded) { LOGE("decoder: WAV decode failed"); return -1; }
+    size_t   n  = (size_t)w.totalPCMFrameCount;
+    uint32_t ch = w.channels;
+    uint32_t sr = w.sampleRate;
 
-    size_t bytes = (size_t)frame_count * channels * sizeof(int16_t);
-    int16_t *locked = alloc_pcm((size_t)frame_count, channels);
-    if (!locked) { drwav_free(decoded, NULL); return -1; }
+    int16_t *locked = alloc_pcm(n, ch);
+    if (!locked) { drwav_uninit(&w); return -1; }
 
-    memcpy(locked, decoded, bytes);
-    drwav_free(decoded, NULL);
+    drwav_uint64 decoded = drwav_read_pcm_frames_s16(&w, (drwav_uint64)n, locked);
+    drwav_uninit(&w);
+
+    if (decoded == 0) {
+        LOGE("decoder: WAV decode produced 0 frames");
+        decoder_free(locked, n, ch);
+        return -1;
+    }
 
     *pcm_out      = locked;
-    *frames_out   = (size_t)frame_count;
-    *rate_out     = rate;
-    *channels_out = channels;
+    *frames_out   = (size_t)decoded;
+    *rate_out     = sr;
+    *channels_out = ch;
     return 0;
 }
 
@@ -146,30 +191,44 @@ static int decode_mp3(const uint8_t *data, size_t data_len,
                       int16_t **pcm_out, size_t *frames_out,
                       uint32_t *rate_out, uint32_t *channels_out)
 {
-    mp3dec_t        mp3d;
-    mp3dec_file_info_t info;
-
-    mp3dec_init(&mp3d);
-    if (mp3dec_load_buf(&mp3d, data, data_len, &info, NULL, NULL) != 0) {
-        LOGE("decoder: MP3 decode failed");
-        return -1;
-    }
-    if (!info.buffer || info.samples == 0) {
-        free(info.buffer);
+    /* mp3dec_ex prescan the Xing/VBRI header to know total frame count up
+     * front, allowing us to allocate the locked mmap buffer once and decode
+     * directly into it — no intermediate heap copy. */
+    mp3dec_ex_t ex;
+    if (mp3dec_ex_open_buf(&ex, data, data_len, MP3D_SEEK_TO_SAMPLE) != 0) {
+        LOGE("decoder: MP3 open failed");
         return -1;
     }
 
-    size_t frames = info.samples / (size_t)(info.channels ? info.channels : 2);
-    int16_t *locked = alloc_pcm(frames, info.channels);
-    if (!locked) { free(info.buffer); return -1; }
+    uint32_t ch = (uint32_t)ex.info.channels;
+    uint32_t sr = (uint32_t)ex.info.hz;
+    if (ch == 0 || ch > 2 || sr == 0) {
+        LOGE("decoder: MP3 invalid stream: channels=%u hz=%u", ch, sr);
+        mp3dec_ex_close(&ex);
+        return -1;
+    }
 
-    memcpy(locked, info.buffer, info.samples * sizeof(int16_t));
-    free(info.buffer);
+    /* ex.samples is total number of PCM samples (all channels interleaved) */
+    size_t total_samples = ex.samples;
+    size_t frames        = total_samples / ch;
+    if (frames == 0) { mp3dec_ex_close(&ex); return -1; }
+
+    int16_t *locked = alloc_pcm(frames, ch);
+    if (!locked) { mp3dec_ex_close(&ex); return -1; }
+
+    size_t decoded = mp3dec_ex_read(&ex, locked, total_samples);
+    mp3dec_ex_close(&ex);
+
+    if (decoded == 0) {
+        LOGE("decoder: MP3 decode produced 0 samples");
+        decoder_free(locked, frames, ch);
+        return -1;
+    }
 
     *pcm_out      = locked;
-    *frames_out   = frames;
-    *rate_out     = (uint32_t)info.hz;
-    *channels_out = (uint32_t)info.channels;
+    *frames_out   = decoded / ch;
+    *rate_out     = sr;
+    *channels_out = ch;
     return 0;
 }
 
@@ -243,18 +302,22 @@ int decoder_probe(const char *path, TrackInfo *info_out)
         drwav_uninit(&w);
         return 0;
     }
-    /* MP3 probe: parse just the first frame header */
+    /* MP3 probe: read enough data for minimp3 to parse the first full frame.
+     * 4 bytes is never sufficient — minimp3 needs the full frame (~400+ bytes)
+     * to return valid hz/channels. Use 4096 to comfortably cover ID3 tags. */
     if (fmt == FMT_MP3) {
         FILE *fp = fopen(path, "rb");
         if (!fp) return -1;
-        uint8_t hdr[4];
-        mp3dec_frame_info_t fi = {0};   /* zero-init: safe if fread < 4 */
-        if (fread(hdr, 1, 4, fp) == 4) {
+        uint8_t hdr[4096];
+        mp3dec_frame_info_t fi = {0};
+        size_t n = fread(hdr, 1, sizeof(hdr), fp);
+        fclose(fp);
+        if (n > 0) {
             mp3dec_t mp3d; mp3dec_init(&mp3d);
             int16_t pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
-            mp3dec_decode_frame(&mp3d, hdr, 4, pcm, &fi);
+            mp3dec_decode_frame(&mp3d, hdr, (int)n, pcm, &fi);
         }
-        fclose(fp);
+        if (fi.hz == 0 || fi.channels == 0) return -1;
         info_out->sample_rate     = (uint32_t)fi.hz;
         info_out->channels        = (uint32_t)fi.channels;
         info_out->bits_per_sample = 16;

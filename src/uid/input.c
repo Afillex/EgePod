@@ -25,7 +25,9 @@
 #endif
 
 #define MAX_INPUT_DEVS  16
-#define SWIPE_THRESHOLD 80
+/* Threshold in raw device pixels.  On a 1080-wide panel a natural swipe
+ * travels 150–300 px; 80 is too easy to trigger accidentally. */
+#define SWIPE_THRESHOLD 150
 
 typedef struct {
     int      fd;

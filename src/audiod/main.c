@@ -15,6 +15,7 @@
 #include <sys/un.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
@@ -65,6 +66,15 @@ int main(void)
     signal(SIGTERM, on_signal);
     signal(SIGINT,  on_signal);
     signal(SIGPIPE, SIG_IGN);
+
+    /* Raise RLIMIT_MEMLOCK to unlimited so mlock() on large PCM buffers
+     * succeeds.  Default limit (64 KB) is far below a 5-min FLAC (~31 MB).
+     * Without this, PCM buffers can be swapped to zram causing audio dropouts. */
+    {
+        struct rlimit rl = { .rlim_cur = RLIM_INFINITY, .rlim_max = RLIM_INFINITY };
+        if (setrlimit(RLIMIT_MEMLOCK, &rl) != 0)
+            LOGW("audiod: setrlimit(MEMLOCK,INF): %s — mlock may fail", strerror(errno));
+    }
 
     /* Build music index (blocking; runs on main thread before event loop) */
     IndexNode *index = index_build(MUSIC_DIR);
@@ -157,6 +167,7 @@ int main(void)
             /* ── position tick ── */
             if (fd == tfd) {
                 uint64_t exp; (void)read(tfd, &exp, sizeof(exp)); /* drain expirations */
+                if (n_clients == 0) continue;   /* no subscribers — skip lock + send */
                 uint32_t pos = player_get_position(player);
                 static uint32_t last_pos = UINT32_MAX;
                 if (pos == UINT32_MAX) {

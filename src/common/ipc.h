@@ -37,7 +37,6 @@ typedef enum {
     CMD_SCREEN_OFF  = 0x41,
     CMD_SCREEN_ON   = 0x42,
     CMD_SET_VOLUME  = 0x43,   /* param.volume (0–100) */
-    CMD_SET_BRIGHTNESS = 0x44,   /* param.volume (0–100) — sent to pwrd */
 
     /* Events: pwrd → UI */
     EVT_BATTERY     = 0xC1,   /* param.battery_pct */

@@ -13,7 +13,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 
 /* ── MT6359 HP mixer path ──────────────────────────────────────────────── */
 /* Control names are codec-driver strings from the AOSP vendor tree for
@@ -37,6 +36,12 @@ static const struct {
 
 static void apply_mixer_path(unsigned int card)
 {
+    /* Apply once per process lifetime — re-applying on every open causes
+     * brief codec register disturbances and unnecessary PMIC digital wakeups. */
+    static int applied = 0;
+    if (applied) return;
+    applied = 1;
+
     struct mixer *mx = mixer_open(card);
     if (!mx) { LOGW("alsa: mixer_open(card %u) failed", card); return; }
 
@@ -47,10 +52,20 @@ static void apply_mixer_path(unsigned int card)
             continue;
         }
         enum mixer_ctl_type t = mixer_ctl_get_type(ctl);
-        int rc = (t == MIXER_CTL_TYPE_BOOL || t == MIXER_CTL_TYPE_INT)
-                     ? mixer_ctl_set_value(ctl, 0, kMixerPath[i].value)
-                     : mixer_ctl_set_enum_by_string(ctl,
-                           mixer_ctl_get_enum_string(ctl, kMixerPath[i].value));
+        int rc;
+        if (t == MIXER_CTL_TYPE_BOOL || t == MIXER_CTL_TYPE_INT) {
+            rc = mixer_ctl_set_value(ctl, 0, kMixerPath[i].value);
+        } else {
+            /* mixer_ctl_get_enum_string returns NULL if index is out of range;
+             * passing NULL to set_enum_by_string is a NULL-deref crash. */
+            const char *s = mixer_ctl_get_enum_string(ctl, kMixerPath[i].value);
+            if (!s) {
+                LOGW("alsa: mixer ctl '%s': enum index %d out of range — skipping",
+                     kMixerPath[i].name, kMixerPath[i].value);
+                continue;
+            }
+            rc = mixer_ctl_set_enum_by_string(ctl, s);
+        }
         if (rc != 0)
             LOGW("alsa: failed to set '%s' = %d", kMixerPath[i].name, kMixerPath[i].value);
     }
@@ -84,7 +99,7 @@ AlsaOut *alsa_out_open(unsigned int card, unsigned int device,
         .channels     = channels,
         .rate         = rate,
         .period_size  = 4096,
-        .period_count = 8,   /* 8×4096 = ~742ms buffer; CPU sleeps longer between refills */
+        .period_count = 4,   /* 4×4096 = ~371ms buffer; MT6785 driver supports up to 4 */
         .format       = PCM_FORMAT_S16_LE,
         /* start_threshold = 0 means hardware starts as soon as first period
          * is written, minimising initial latency. */
@@ -122,16 +137,17 @@ int alsa_out_write(AlsaOut *out, const int16_t *frames, size_t frame_count)
 
 int alsa_out_pause(AlsaOut *out)
 {
-    /* Hardware pause keeps the codec warm so resume has no pop/click. */
-    int rc = pcm_ioctl(out->pcm, SNDRV_PCM_IOCTL_PAUSE, 1);
-    if (rc != 0) LOGW("alsa: pause ioctl: %s", strerror(errno));
+    /* pcm_pause() is the tinyalsa v2.0.0 API for hardware pause.
+     * It keeps the codec clock running so resume avoids a pop/click. */
+    int rc = pcm_pause(out->pcm, 1);
+    if (rc != 0) LOGW("alsa: pcm_pause(1): %s", pcm_get_error(out->pcm));
     return rc;
 }
 
 int alsa_out_resume(AlsaOut *out)
 {
-    int rc = pcm_ioctl(out->pcm, SNDRV_PCM_IOCTL_PAUSE, 0);
-    if (rc != 0) LOGW("alsa: resume ioctl: %s", strerror(errno));
+    int rc = pcm_pause(out->pcm, 0);
+    if (rc != 0) LOGW("alsa: pcm_pause(0): %s", pcm_get_error(out->pcm));
     return rc;
 }
 
@@ -140,4 +156,11 @@ void alsa_out_close(AlsaOut *out)
     if (!out) return;
     pcm_close(out->pcm);
     free(out);
+}
+
+int alsa_out_matches_format(const AlsaOut *out, unsigned int rate,
+                            unsigned int channels)
+{
+    if (!out) return 0;
+    return out->cfg.rate == rate && out->cfg.channels == channels;
 }

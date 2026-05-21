@@ -473,6 +473,12 @@ int alsa_out_resume(AlsaOut *out)
     return 0;
 }
 
+int alsa_out_matches_format(const AlsaOut *out, unsigned int rate, unsigned int channels)
+{
+    if (!out) return 0;
+    return out->rate == rate && out->channels == channels;
+}
+
 void alsa_out_close(AlsaOut *out)
 {
     if (!out) return;

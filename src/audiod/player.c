@@ -27,7 +27,6 @@
 
 #define ALSA_CARD      0
 #define ALSA_DEVICE    0
-#define MUSIC_DIR      "/sdcard/Music"
 #define PERIOD_FRAMES  4096u   /* PCM frames per playback write (~93ms @ 44.1kHz) */
 
 /* ── types ─────────────────────────────────────────────────────────────── */
@@ -148,7 +147,7 @@ static void *prefetch_thread(void *arg)
         while (!p->quit && p->next_buf.pcm)
             pthread_cond_wait(&p->cond_loaded, &p->lock);
         if (p->quit) { pthread_mutex_unlock(&p->lock); break; }
-        LOGI("player: prefetch woke: cur_track=%zu next_buf.pcm=%p",
+        LOGD("player: prefetch woke: cur_track=%zu next_buf.pcm=%p",
              p->cur_track, (void*)p->next_buf.pcm);
 
         size_t n = index_track_count(p->index);
@@ -169,7 +168,27 @@ static void *prefetch_thread(void *arg)
             nb.info.duration_ms = (uint32_t)((uint64_t)nb.frames * 1000 / nb.rate);
 
         pthread_mutex_lock(&p->lock);
-        p->next_buf = nb;
+        {
+            /* Validate the decoded track is still the correct next-up.
+             * CMD_PREV (or any slow-path CMD_NEXT) can change cur_track while
+             * this thread was decoding outside the lock.  Storing a stale
+             * buffer here would permanently block prefetch (the cond_wait
+             * condition checks next_buf.pcm != NULL) and waste up to 256 MB
+             * of locked RAM until player_destroy(). */
+            size_t total_n = index_track_count(p->index);
+            const TrackInfo *want = (total_n > 0)
+                ? index_get_track(p->index, (p->cur_track + 1) % total_n)
+                : NULL;
+            if (want && strcmp(nb.info.path, want->path) == 0) {
+                p->next_buf = nb;
+            } else {
+                LOGD("player: prefetch: stale decode for '%s' — discarding, will retry",
+                     nb.info.path);
+                pcmbuf_free(&nb);
+                /* next_buf stays NULL; cond_signal below re-enters the decode
+                 * loop immediately and picks the now-correct next track. */
+            }
+        }
         pthread_cond_signal(&p->cond_loaded);
         pthread_mutex_unlock(&p->lock);
     }
@@ -264,10 +283,21 @@ static void load_track(Player *p, size_t idx)
     /* Signal prefetch after cur_track is updated so it decodes (idx+1). */
     pthread_cond_signal(&p->cond_loaded);
 
-    /* Keep the ALSA device open across track changes when format is the same
-     * (avoids the codec re-init gap that causes an audible click/stutter). */
+    /* Keep the ALSA device open across track changes when format is identical
+     * (avoids the codec re-init gap that causes an audible click/stutter).
+     * If the sample rate or channel count changed, close and reopen — keeping
+     * the device open at the wrong rate causes pitch shift and distortion. */
+    if (p->alsa && !alsa_out_matches_format(p->alsa,
+                                            p->cur_buf.rate,
+                                            p->cur_buf.channels)) {
+        LOGI("player: load_track — format changed (%u/%u), reopening ALSA",
+             p->cur_buf.rate, p->cur_buf.channels);
+        alsa_out_close(p->alsa);
+        p->alsa = NULL;
+    }
     if (!p->alsa) {
-        LOGI("player: load_track — ALSA not open, opening now");
+        LOGI("player: load_track — opening ALSA %u Hz / %u ch",
+             p->cur_buf.rate, p->cur_buf.channels);
         p->alsa = alsa_out_open(ALSA_CARD, ALSA_DEVICE,
                                 p->cur_buf.rate, p->cur_buf.channels, 16);
         if (!p->alsa) {
@@ -276,10 +306,10 @@ static void load_track(Player *p, size_t idx)
             return;
         }
     }
-    /* If we were paused, stop the silence-fill thread before the playback
-     * thread starts writing real audio.  No-op when silence thread is not
-     * running (e.g. CMD_NEXT without a preceding pause). */
-    alsa_out_resume(p->alsa);
+    /* Resume only if we were actually paused — calling pcm_pause(0) on a
+     * device that was never paused returns an error from the MT6785 driver. */
+    if (p->state == PLAYER_PAUSED && p->alsa)
+        alsa_out_resume(p->alsa);
     SET_STATE(p, PLAYER_PLAYING, "load_track done");
 
     /* Anchor wall-clock position to the moment the track starts. */
@@ -309,7 +339,7 @@ static void *playback_thread(void *arg)
             LOGI("player: ALSA closed (state=IDLE)");
         }
         if (p->state != PLAYER_PLAYING)
-            LOGI("player: playback cond_wait (state=%s)", state_name(p->state));
+            LOGD("player: playback cond_wait (state=%s)", state_name(p->state));
         while (!p->quit && p->state != PLAYER_PLAYING)
             pthread_cond_wait(&p->cond_play, &p->lock);
         if (p->state == PLAYER_PLAYING)
@@ -354,7 +384,7 @@ static void *playback_thread(void *arg)
         /* Copy PCM before dropping the lock — prevents use-after-free if
          * CMD_NEXT/PREV calls pcmbuf_free mid-write.  static is safe: exactly
          * one playback thread exists, so there is no reentrancy concern. */
-        static int16_t  pcm_local[PERIOD_FRAMES * 2];
+        static int16_t  pcm_local[PERIOD_FRAMES * 8];   /* 8 = max supported channels */
         memcpy(pcm_local,
                p->cur_buf.pcm + p->cur_frame * p->cur_buf.channels,
                chunk * p->cur_buf.channels * sizeof(int16_t));
@@ -445,12 +475,19 @@ IpcMsg player_handle_cmd(Player *p, const IpcMsg *cmd)
         /* Accept PLAY from PAUSED, IDLE, and ERROR (error recovery). */
         if (p->state == PLAYER_PAUSED || p->state == PLAYER_IDLE ||
             p->state == PLAYER_ERROR) {
-            if (p->alsa) alsa_out_resume(p->alsa);
+            /* Only resume hardware pause — never call pcm_pause(0) on a
+             * running or closed device; MT6785 driver returns an error. */
+            if (p->state == PLAYER_PAUSED && p->alsa) alsa_out_resume(p->alsa);
             /* Re-anchor wall clock at the paused position so the position
-             * counter continues from where it stopped, not from 0. */
+             * counter continues from where it stopped, not from 0.
+             * Only inherit pos_at_pause_ms when actually resuming from PAUSED —
+             * from IDLE/ERROR, cur_frame is already 0 and pos_at_pause_ms may
+             * carry a stale value from a previous session, which would show the
+             * wrong timestamp while audio plays from the beginning. */
             if (p->cur_buf.rate) {
-                p->frame_at_play_start = (uint64_t)p->pos_at_pause_ms
-                                        * p->cur_buf.rate / 1000;
+                p->frame_at_play_start = (p->state == PLAYER_PAUSED)
+                    ? (uint64_t)p->pos_at_pause_ms * p->cur_buf.rate / 1000
+                    : 0;
             }
             clock_gettime(CLOCK_MONOTONIC, &p->play_start_mono);
             p->wall_clock_valid = 1;

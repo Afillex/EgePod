@@ -3,8 +3,14 @@
 #include "../common/ipc.h"
 #include "../common/track.h"
 
+/* ── Virtual canvas dimensions (design space) ─────────────────────────────
+ * All layout constants and hit-test coords are in this 720×1280 space.
+ * render_frame() scale-blits to the actual display at runtime.            */
+#define UI_DESIGN_W  720
+#define UI_DESIGN_H  1280
+
 /* ── Hit-test layout constants shared with main.c ─────────────────────────
- * All values in framebuffer pixels (720×1280 portrait).                    */
+ * All values in virtual canvas pixels (720×1280 portrait).                */
 
 #define UI_CTRL_Y          824
 #define UI_CTRL_H           74

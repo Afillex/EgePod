@@ -168,22 +168,6 @@ void fb_flip(FbCtx *ctx)
     ctx->active_buf = back;
 }
 
-void fb_clear(FbCtx *ctx, uint32_t colour)
-{
-    uint32_t *p = fb_back(ctx);
-    size_t    n = ctx->page_size / sizeof(uint32_t);
-    for (size_t i = 0; i < n; i++) p[i] = colour;
-}
-
-void fb_fill_rect(FbCtx *ctx, int x, int y, int w, int h, uint32_t colour)
-{
-    uint32_t *p    = fb_back(ctx);
-    uint32_t stride = ctx->stride / sizeof(uint32_t);
-    for (int row = y; row < y + h && (uint32_t)row < ctx->height; row++)
-        for (int col = x; col < x + w && (uint32_t)col < ctx->width; col++)
-            p[row * stride + col] = colour;
-}
-
 void fb_set_brightness(int level)
 {
     FILE *f = fopen("/sys/class/leds/lcd-backlight/brightness", "w");

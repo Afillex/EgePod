@@ -158,8 +158,18 @@ int main(void)
             /* ── audiod events ── */
             if (fd == audiod_fd) {
                 if (events[i].events & (EPOLLHUP | EPOLLERR)) {
-                    LOGE("uid: audiod connection lost — exiting");
-                    g_quit = 1;
+                    LOGE("uid: audiod connection lost — attempting reconnect");
+                    epoll_ctl(ep, EPOLL_CTL_DEL, audiod_fd, NULL);
+                    close(audiod_fd);
+                    audiod_fd = ipc_connect(AUDIOD_SOCK_PATH);
+                    if (audiod_fd >= 0) {
+                        ev.events = EPOLLIN | EPOLLHUP;
+                        ev.data.fd = audiod_fd;
+                        epoll_ctl(ep, EPOLL_CTL_ADD, audiod_fd, &ev);
+                        LOGI("uid: audiod reconnected");
+                    } else {
+                        LOGE("uid: audiod reconnect failed — UI will be static");
+                    }
                     break;
                 }
                 IpcMsg msg;
@@ -249,11 +259,18 @@ int main(void)
                     if (g_screen_on) screen_off();
                     else             screen_on();
                     break;
-                case INPUT_TAP:
+                case INPUT_TAP: {
+                    /* Scale from physical device pixels to 720×1280 design space */
+                    int tap_x = (g_fb.width  > 0)
+                                ? (int)((int64_t)ie.x * UI_DESIGN_W / (int)g_fb.width)
+                                : ie.x;
+                    int tap_y = (g_fb.height > 0)
+                                ? (int)((int64_t)ie.y * UI_DESIGN_H / (int)g_fb.height)
+                                : ie.y;
                     if (!g_screen_on) { screen_on(); break; }
                     if (g_ui.lib_mode) {
                         /* Library view: y < back threshold → exit; else select row */
-                        if (ie.y < UI_LIB_BACK_H) {
+                        if (tap_y < UI_LIB_BACK_H) {
                             pthread_mutex_lock(&g_ui_lock);
                             g_ui.lib_mode = 0;
                             pthread_mutex_unlock(&g_ui_lock);
@@ -264,7 +281,7 @@ int main(void)
                             uint32_t total = g_ui.track_count;
                             pthread_mutex_unlock(&g_ui_lock);
                             /* rows start at y = UI_LIB_BACK_H + 4 */
-                            int row  = (ie.y - (UI_LIB_BACK_H + 4)) / UI_LIB_ROW_H;
+                            int row  = (tap_y - (UI_LIB_BACK_H + 4)) / UI_LIB_ROW_H;
                             int tidx = scroll + row;
                             if (row >= 0 && (uint32_t)tidx < total) {
                                 ipc_send_cmd(audiod_fd, CMD_LOAD_TRACK, (uint32_t)tidx);
@@ -277,9 +294,9 @@ int main(void)
                         }
                     } else {
                         /* Player view: brightness bar tap first, then library enter */
-                        if (ie.y >= UI_BRIGHT_Y &&
-                                ie.y < UI_BRIGHT_Y + UI_BRIGHT_H) {
-                            int bx = ie.x - UI_BRIGHT_X;
+                        if (tap_y >= UI_BRIGHT_Y &&
+                                tap_y < UI_BRIGHT_Y + UI_BRIGHT_H) {
+                            int bx = tap_x - UI_BRIGHT_X;
                             if (bx < 0) bx = 0;
                             if (bx > UI_BRIGHT_W) bx = UI_BRIGHT_W;
                             uint32_t brt = (uint32_t)
@@ -290,14 +307,14 @@ int main(void)
                             fb_set_brightness((int)(brt * 255 / 100));
                             request_redraw();
                         } else
-                        if (ie.y >= UI_LIB_ENTER_Y &&
-                                ie.y < UI_LIB_ENTER_Y + UI_LIB_ENTER_H) {
+                        if (tap_y >= UI_LIB_ENTER_Y &&
+                                tap_y < UI_LIB_ENTER_Y + UI_LIB_ENTER_H) {
                             pthread_mutex_lock(&g_ui_lock);
                             g_ui.lib_mode = 1;
                             pthread_mutex_unlock(&g_ui_lock);
                             request_redraw();
-                        } else if (ie.y >= UI_CTRL_Y && ie.y <= UI_CTRL_Y + UI_CTRL_H) {
-                            int x = ie.x;
+                        } else if (tap_y >= UI_CTRL_Y && tap_y <= UI_CTRL_Y + UI_CTRL_H) {
+                            int x = tap_x;
                             if (x >= UI_BTN_PREV_X && x < UI_BTN_PREV_X + UI_BTN_PREV_W)
                                 ipc_send_cmd(audiod_fd, CMD_PREV, 0);
                             else if (x >= UI_BTN_PLAY_X && x < UI_BTN_PLAY_X + UI_BTN_PLAY_W)
@@ -308,6 +325,7 @@ int main(void)
                         }
                     }
                     break;
+                }
                 case INPUT_SWIPE_LEFT:
                     if (g_screen_on && !g_ui.lib_mode)
                         ipc_send_cmd(audiod_fd, CMD_NEXT, 0);
