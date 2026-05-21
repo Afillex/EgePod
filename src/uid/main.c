@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 /* ── forward declarations from ipc_client.c ─────────────────────────────── */
 int ipc_connect(const char *path);
@@ -41,6 +42,7 @@ int ipc_recv(int fd, IpcMsg *out);
 
 static volatile int   g_quit          = 0;
 static int            g_screen_on     = 1;
+static int            g_lib_fetch_idx = -1;  /* next track idx to fetch; -1 = done */
 static pthread_t      g_render_tid;
 static sem_t          g_render_sem;     /* posted when a new frame is needed */
 static FbCtx          g_fb;
@@ -137,6 +139,8 @@ int main(void)
 
     /* Initial draw */
     g_ui.battery_pct = 100;
+    g_ui.brightness  = 80;
+    fb_set_brightness(204);  /* 80 × 255 / 100 */
     request_redraw();
 
     struct epoll_event events[16];
@@ -153,19 +157,57 @@ int main(void)
 
             /* ── audiod events ── */
             if (fd == audiod_fd) {
+                if (events[i].events & (EPOLLHUP | EPOLLERR)) {
+                    LOGE("uid: audiod connection lost — exiting");
+                    g_quit = 1;
+                    break;
+                }
                 IpcMsg msg;
                 if (ipc_recv(audiod_fd, &msg) == 0) {
                     pthread_mutex_lock(&g_ui_lock);
                     switch ((IpcMsgType)msg.type) {
                     case EVT_INDEX_READY:
+                        g_ui.track_count    = msg.param.track_count;
+                        g_ui.library_loaded = 0;
+                        g_lib_fetch_idx     = 0;
                         /* Auto-play first track on startup */
                         if (audiod_fd >= 0 && g_ui.state == PLAYER_IDLE) {
                             ipc_send_cmd(audiod_fd, CMD_LOAD_TRACK, 0);
                             ipc_send_cmd(audiod_fd, CMD_PLAY, 0);
                         }
+                        /* Kick off background library metadata fetch */
+                        if (msg.param.track_count > 0 && audiod_fd >= 0)
+                            ipc_send_cmd(audiod_fd, CMD_GET_TRACK_INFO, 0);
                         break;
+                    case EVT_TRACK_INFO: {
+                        uint32_t tidx = msg.seq;
+                        if (tidx < MAX_LIB_TRACKS) {
+                            LibEntry *e = &g_ui.library[tidx];
+                            snprintf(e->title,  sizeof(e->title),
+                                     "%s", msg.param.track.title);
+                            snprintf(e->artist, sizeof(e->artist),
+                                     "%s", msg.param.track.artist);
+                            e->duration_ms = msg.param.track.duration_ms;
+                            e->track_idx   = tidx;
+                            if (tidx + 1 > g_ui.library_loaded)
+                                g_ui.library_loaded = tidx + 1;
+                        }
+                        /* Chain: fetch next track's metadata */
+                        if (g_lib_fetch_idx >= 0 && audiod_fd >= 0) {
+                            g_lib_fetch_idx++;
+                            if ((uint32_t)g_lib_fetch_idx < g_ui.track_count
+                                    && g_lib_fetch_idx < MAX_LIB_TRACKS)
+                                ipc_send_cmd(audiod_fd, CMD_GET_TRACK_INFO,
+                                             (uint32_t)g_lib_fetch_idx);
+                            else
+                                g_lib_fetch_idx = -1;
+                        }
+                        break;
+                    }
                     case EVT_TRACK:
-                        g_ui.track = msg.param.track;
+                        g_ui.track         = msg.param.track;
+                        g_ui.position_ms   = 0;
+                        g_ui.cur_track_idx = msg.seq;
                         break;
                     case EVT_STATE:
                         g_ui.state = msg.param.player_state;
@@ -183,6 +225,11 @@ int main(void)
 
             /* ── pwrd events ── */
             if (fd == pwrd_fd) {
+                if (events[i].events & (EPOLLHUP | EPOLLERR)) {
+                    LOGE("uid: pwrd connection lost — exiting");
+                    g_quit = 1;
+                    break;
+                }
                 IpcMsg msg;
                 if (ipc_recv(pwrd_fd, &msg) == 0) {
                     pthread_mutex_lock(&g_ui_lock);
@@ -204,26 +251,111 @@ int main(void)
                     break;
                 case INPUT_TAP:
                     if (!g_screen_on) { screen_on(); break; }
-                    /* Hit test transport controls (portrait 1080 wide) */
-                    {
-                        int cx = 1080 / 2;
-                        int spacing = 200;
-                        if (ie.y >= 890 && ie.y <= 1000) {
-                            if (ie.x > cx - spacing - 60 && ie.x < cx - spacing + 60)
+                    if (g_ui.lib_mode) {
+                        /* Library view: y < back threshold → exit; else select row */
+                        if (ie.y < UI_LIB_BACK_H) {
+                            pthread_mutex_lock(&g_ui_lock);
+                            g_ui.lib_mode = 0;
+                            pthread_mutex_unlock(&g_ui_lock);
+                            request_redraw();
+                        } else {
+                            pthread_mutex_lock(&g_ui_lock);
+                            int scroll     = g_ui.lib_scroll;
+                            uint32_t total = g_ui.track_count;
+                            pthread_mutex_unlock(&g_ui_lock);
+                            /* rows start at y = UI_LIB_BACK_H + 4 */
+                            int row  = (ie.y - (UI_LIB_BACK_H + 4)) / UI_LIB_ROW_H;
+                            int tidx = scroll + row;
+                            if (row >= 0 && (uint32_t)tidx < total) {
+                                ipc_send_cmd(audiod_fd, CMD_LOAD_TRACK, (uint32_t)tidx);
+                                ipc_send_cmd(audiod_fd, CMD_PLAY, 0);
+                                pthread_mutex_lock(&g_ui_lock);
+                                g_ui.lib_mode = 0;
+                                pthread_mutex_unlock(&g_ui_lock);
+                                request_redraw();
+                            }
+                        }
+                    } else {
+                        /* Player view: brightness bar tap first, then library enter */
+                        if (ie.y >= UI_BRIGHT_Y &&
+                                ie.y < UI_BRIGHT_Y + UI_BRIGHT_H) {
+                            int bx = ie.x - UI_BRIGHT_X;
+                            if (bx < 0) bx = 0;
+                            if (bx > UI_BRIGHT_W) bx = UI_BRIGHT_W;
+                            uint32_t brt = (uint32_t)
+                                ((uint64_t)bx * 100 / UI_BRIGHT_W);
+                            pthread_mutex_lock(&g_ui_lock);
+                            g_ui.brightness = brt;
+                            pthread_mutex_unlock(&g_ui_lock);
+                            fb_set_brightness((int)(brt * 255 / 100));
+                            request_redraw();
+                        } else
+                        if (ie.y >= UI_LIB_ENTER_Y &&
+                                ie.y < UI_LIB_ENTER_Y + UI_LIB_ENTER_H) {
+                            pthread_mutex_lock(&g_ui_lock);
+                            g_ui.lib_mode = 1;
+                            pthread_mutex_unlock(&g_ui_lock);
+                            request_redraw();
+                        } else if (ie.y >= UI_CTRL_Y && ie.y <= UI_CTRL_Y + UI_CTRL_H) {
+                            int x = ie.x;
+                            if (x >= UI_BTN_PREV_X && x < UI_BTN_PREV_X + UI_BTN_PREV_W)
                                 ipc_send_cmd(audiod_fd, CMD_PREV, 0);
-                            else if (ie.x > cx - 80 && ie.x < cx + 80)
+                            else if (x >= UI_BTN_PLAY_X && x < UI_BTN_PLAY_X + UI_BTN_PLAY_W)
                                 ipc_send_cmd(audiod_fd,
                                     g_ui.state == PLAYER_PLAYING ? CMD_PAUSE : CMD_PLAY, 0);
-                            else if (ie.x > cx + spacing - 60 && ie.x < cx + spacing + 60)
+                            else if (x >= UI_BTN_NEXT_X && x < UI_BTN_NEXT_X + UI_BTN_NEXT_W)
                                 ipc_send_cmd(audiod_fd, CMD_NEXT, 0);
                         }
                     }
                     break;
                 case INPUT_SWIPE_LEFT:
-                    if (g_screen_on) ipc_send_cmd(audiod_fd, CMD_NEXT, 0);
+                    if (g_screen_on && !g_ui.lib_mode)
+                        ipc_send_cmd(audiod_fd, CMD_NEXT, 0);
                     break;
                 case INPUT_SWIPE_RIGHT:
-                    if (g_screen_on) ipc_send_cmd(audiod_fd, CMD_PREV, 0);
+                    if (g_screen_on && !g_ui.lib_mode)
+                        ipc_send_cmd(audiod_fd, CMD_PREV, 0);
+                    break;
+                case INPUT_SWIPE_UP:
+                    if (g_screen_on) {
+                        if (g_ui.lib_mode) {
+                            pthread_mutex_lock(&g_ui_lock);
+                            int max_s = (int)g_ui.track_count - UI_LIB_VISIBLE;
+                            if (max_s > 0 && g_ui.lib_scroll < max_s)
+                                g_ui.lib_scroll++;
+                            pthread_mutex_unlock(&g_ui_lock);
+                            request_redraw();
+                        } else {
+                            pthread_mutex_lock(&g_ui_lock);
+                            if (g_ui.brightness < 100) {
+                                g_ui.brightness += 10;
+                                if (g_ui.brightness > 100) g_ui.brightness = 100;
+                            }
+                            fb_set_brightness((int)(g_ui.brightness * 255 / 100));
+                            pthread_mutex_unlock(&g_ui_lock);
+                            request_redraw();
+                        }
+                    }
+                    break;
+                case INPUT_SWIPE_DOWN:
+                    if (g_screen_on) {
+                        if (g_ui.lib_mode) {
+                            pthread_mutex_lock(&g_ui_lock);
+                            if (g_ui.lib_scroll > 0) g_ui.lib_scroll--;
+                            pthread_mutex_unlock(&g_ui_lock);
+                            request_redraw();
+                        } else {
+                            pthread_mutex_lock(&g_ui_lock);
+                            if (g_ui.brightness >= 10) {
+                                g_ui.brightness -= 10;
+                            } else {
+                                g_ui.brightness = 0;
+                            }
+                            fb_set_brightness((int)(g_ui.brightness * 255 / 100));
+                            pthread_mutex_unlock(&g_ui_lock);
+                            request_redraw();
+                        }
+                    }
                     break;
                 case INPUT_VOLUME_UP:
                     ipc_send_cmd(pwrd_fd, CMD_SET_VOLUME, 0);   /* handled by pwrd */

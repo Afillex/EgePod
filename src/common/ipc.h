@@ -23,6 +23,7 @@ typedef enum {
     CMD_LOAD_TRACK  = 0x07,   /* param.track_idx */
     CMD_GET_STATE   = 0x08,
     CMD_GET_INDEX   = 0x09,
+    CMD_GET_TRACK_INFO = 0x0A,   /* param.track_idx → EVT_TRACK_INFO (no decode) */
 
     /* Events: audiod → UI */
     EVT_STATE       = 0x81,   /* param.player_state */
@@ -30,11 +31,13 @@ typedef enum {
     EVT_POSITION    = 0x83,   /* param.position_ms */
     EVT_INDEX_READY = 0x84,   /* param.track_count */
     EVT_ERROR       = 0x85,   /* param.error_code */
+    EVT_TRACK_INFO  = 0x86,   /* param.track — metadata only, no decode */
 
     /* Commands: UI → pwrd */
     CMD_SCREEN_OFF  = 0x41,
     CMD_SCREEN_ON   = 0x42,
     CMD_SET_VOLUME  = 0x43,   /* param.volume (0–100) */
+    CMD_SET_BRIGHTNESS = 0x44,   /* param.volume (0–100) — sent to pwrd */
 
     /* Events: pwrd → UI */
     EVT_BATTERY     = 0xC1,   /* param.battery_pct */

@@ -16,6 +16,7 @@ VIEWER="$OUT/fb_viewer_macos"
 FB_RAW="$OUT/egepod_fb.raw"
 VM="egepod-sim"
 FORCE_REBUILD="${1:-}"
+AUDIO_PORT=12321          # TCP port: macOS ffplay listens, VM audiod connects
 
 # ── colours ──────────────────────────────────────────────────────────────────
 GRN='\033[0;32m'; YLW='\033[0;33m'; RED='\033[0;31m'; RST='\033[0m'
@@ -38,6 +39,11 @@ need_vm_build=0
 
 if [[ $need_vm_build -eq 1 ]]; then
     step "Building VM binaries (aarch64-linux)..."
+    # Install Nimbus Sans Bold (Helvetica-compatible) if not present
+    orb run -m "$VM" sudo bash -c "
+        dpkg -l fonts-urw-base35 2>/dev/null | grep -q '^ii' || \
+            (apt-get update -qq && apt-get install -y -q fonts-urw-base35)
+    " 2>/dev/null || warn "fonts-urw-base35 install skipped — will use DejaVu fallback"
     orb run -m "$VM" bash -c "
         cd '$PROJ'
         [[ '$FORCE_REBUILD' == '--rebuild' ]] && make -f sim/Makefile.sim clean
@@ -57,44 +63,92 @@ if [[ ! -f "$VIEWER" || "$PROJ/sim/fb_viewer.c" -nt "$VIEWER" ]]; then
         -O2 -o "$VIEWER" || fatal "fb_viewer build failed"
 fi
 
-# ── 4. kill stale viewer and VM daemons ──────────────────────────────────────
+# ── 4. kill stale viewer, audio bridge and VM daemons ────────────────────────
 step "Stopping previous daemons..."
 pkill -f fb_viewer_macos 2>/dev/null || true
+pkill -9 ffplay 2>/dev/null || true
+# Delete stale sidecar files; also delete the raw FB so no old-UI pixels survive
+# until uid renders its first frame (fb_open_sim zero-inits on create).
+rm -f "$FB_RAW" "$FB_RAW.tap" "$FB_RAW.page" 2>/dev/null || true
+# Force-kill everything in the VM and poll until the processes are gone.
+# Two-wave kill: SIGTERM first so threads can unwind, then SIGKILL after 1 s.
 orb run -m "$VM" bash -c "
-    pkill -f egepod_audiod 2>/dev/null; \
-    pkill -f egepod_pwrd   2>/dev/null; \
-    pkill -f egepod_uid    2>/dev/null; \
-    sleep 0.3; \
+    pkill -15 -f 'egepod_(audiod|pwrd|uid)' 2>/dev/null || true
+    sleep 1
+    pkill -9  -f 'egepod_(audiod|pwrd|uid)' 2>/dev/null || true
+    # Poll up to 6 s for all egepod processes to disappear
+    for i in \$(seq 1 60); do
+        pgrep -f 'egepod_(audiod|pwrd|uid)' > /dev/null 2>&1 || break
+        sleep 0.1
+    done
+    # Final check — warn if any survived
+    if pgrep -f 'egepod_(audiod|pwrd|uid)' > /dev/null 2>&1; then
+        echo 'WARNING: some egepod processes still alive after kill' >&2
+        pgrep -a -f 'egepod_' >&2
+    fi
     rm -f /tmp/egepod_audiod.sock /tmp/egepod_pwrd.sock \
           /tmp/egepod_audiod_ready /tmp/egepod_pwrd_ready
 " 2>/dev/null || true
+
+# ── 4.5. start macOS audio sink ──────────────────────────────────────────────
+# ffplay listens for a raw s16le PCM TCP connection.  audiod in the VM connects
+# to host.orb.internal:AUDIO_PORT.  This avoids the orb stdio bridge bottleneck
+# and the OrbStack VM's PulseAudio null sink (VM has no real audio hardware).
+#
+# If ffplay lacks TCP-listen support (rare), use:
+#   nc -l $AUDIO_PORT | ffplay -f s16le -ar 44100 -ac 2 -nodisp -
+step "Starting macOS audio sink (ffplay TCP :$AUDIO_PORT)..."
+# ffplay 8.x dropped -ac; use -ch_layout stereo instead
+ffplay -f s16le -ar 44100 -ch_layout stereo -nodisp -loglevel warning \
+    "tcp://0.0.0.0:${AUDIO_PORT}?listen=1" \
+    </dev/null >>/tmp/ffplay_audio.log 2>&1 &
+FFPLAY_PID=$!
+# Wait up to 3 s for ffplay to bind the port
+_bound=0
+for _i in $(seq 1 30); do
+    lsof -iTCP:${AUDIO_PORT} -sTCP:LISTEN 2>/dev/null | grep -q . && { _bound=1; break; }
+    sleep 0.1
+done
+if [[ $_bound -eq 0 ]]; then
+    warn "ffplay did not bind :${AUDIO_PORT} — audio may be silent"
+    warn "Check /tmp/ffplay_audio.log for errors"
+else
+    step "ffplay listening on :${AUDIO_PORT} (pid $FFPLAY_PID)"
+fi
 
 # ── 5. start VM daemons ───────────────────────────────────────────────────────
 step "Starting daemons in OrbStack VM ($VM)..."
 orb run -m "$VM" bash -c "
     cd '$PROJ'
     export EGEPOD_FB_FILE='$FB_RAW'
-    export EGEPOD_FONT_PATH=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
-    export PULSE_SERVER=unix:/run/user/501/pulse/native
     export MUSIC_DIR=\${MUSIC_DIR:-/sdcard/Music}
+    # PulseAudio ALSA plugin needs XDG_RUNTIME_DIR to find its socket.
+    # Set it explicitly so nohup'd daemons find PA even without a login env.
+    export XDG_RUNTIME_DIR=/run/user/\$(id -u)
+    export PULSE_SERVER=unix:\$XDG_RUNTIME_DIR/pulse/native
+    # TCP audio out: audiod connects to macOS ffplay listener (bypasses null sink)
+    export EGEPOD_AUDIO_OUT='tcp://host.orb.internal:$AUDIO_PORT'
+    # Let render.c pick the best available font (Nimbus Sans Bold → DejaVu)
+    unset EGEPOD_FONT_PATH
 
     nohup ./out/sim/egepod_pwrd > /tmp/pwrd.log 2>&1 &
     sleep 1
-    MUSIC_DIR=\$MUSIC_DIR PULSE_SERVER=\$PULSE_SERVER \
+    MUSIC_DIR=\$MUSIC_DIR \
+    EGEPOD_AUDIO_OUT=\$EGEPOD_AUDIO_OUT \
     nohup ./out/sim/egepod_audiod > /tmp/audiod.log 2>&1 &
     sleep 3
-    EGEPOD_FB_FILE=\$EGEPOD_FB_FILE EGEPOD_FONT_PATH=\$EGEPOD_FONT_PATH \
+    EGEPOD_FB_FILE=\$EGEPOD_FB_FILE \
     nohup ./out/sim/egepod_uid > /tmp/uid.log 2>&1 &
     sleep 2
     # Quick sanity check
     running=\$(ps aux | grep -cE 'egepod_(audiod|pwrd|uid)' || true)
     echo \"Daemons running: \$running/3\"
-    journalctl -n 6 --no-pager 2>/dev/null | grep egepod | grep -v 'WARN\|sysfs' | tail -5 || true
+    journalctl -n 20 --no-pager 2>/dev/null | grep egepod | grep -v 'DEBUG\|WARN.*sysfs' | tail -6 || true
 " || fatal "Failed to start daemons in VM"
 
 # ── 6. wait for framebuffer file (uid writes it on first render) ──────────────
 step "Waiting for first frame..."
-FB_SIZE=20736000   # 1080 × 2400 × 4 bytes × 2 pages
+FB_SIZE=7372800    # 720 × 1280 × 4 bytes × 2 pages (same count as 1280×720)
 deadline=$((SECONDS + 15))
 while [[ $SECONDS -lt $deadline ]]; do
     sz=$(stat -f%z "$FB_RAW" 2>/dev/null || echo 0)

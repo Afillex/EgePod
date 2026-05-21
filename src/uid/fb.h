@@ -11,6 +11,7 @@ typedef struct {
     void    *buf[2];      /* two framebuffer pages for double-buffering */
     int      active_buf;  /* index of the currently displayed page */
     size_t   page_size;   /* bytes per page */
+    uint32_t flip_gen;    /* incremented on every fb_flip; viewer polls this */
 } FbCtx;
 
 /* Open /dev/fb0, map both framebuffer pages.

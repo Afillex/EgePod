@@ -26,8 +26,8 @@
  * fb_viewer.c on macOS reads the same file for display. */
 #ifdef SIMULATE
 #define SIM_FB_DEFAULT "/tmp/egepod_fb.raw"
-#define SIM_FB_W 1080
-#define SIM_FB_H 2400
+#define SIM_FB_W 720
+#define SIM_FB_H 1280
 
 static int fb_open_sim(FbCtx *ctx)
 {
@@ -52,6 +52,11 @@ static int fb_open_sim(FbCtx *ctx)
     if (map == MAP_FAILED) {
         LOGE("fb_sim: mmap: %s", strerror(errno)); close(fd); return -1;
     }
+
+    /* Zero-init so no stale pixels from a previous session bleed through
+     * before the first render completes. */
+    memset(map, 0, total);
+    msync(map, total, MS_SYNC);
 
     ctx->fd     = fd;
     ctx->buf[0] = map;
@@ -149,9 +154,10 @@ void fb_flip(FbCtx *ctx)
     /* File-backed sim: write the page index so fb_viewer picks the right page */
     const char *path = getenv("EGEPOD_FB_FILE");
     if (!path) path = SIM_FB_DEFAULT;
+    ctx->flip_gen++;
     char side[256]; snprintf(side, sizeof(side), "%s.page", path);
     FILE *f = fopen(side, "w");
-    if (f) { fprintf(f, "%d\n", back); fclose(f); }
+    if (f) { fprintf(f, "%d %u\n", back, ctx->flip_gen); fclose(f); }
 #else
     struct fb_var_screeninfo vinfo;
     if (ioctl(ctx->fd, FBIOGET_VSCREENINFO, &vinfo) == 0) {

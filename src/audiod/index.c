@@ -93,9 +93,12 @@ static void scan_dir(IndexNode *dir_node, const char *path)
             snprintf(ti->title, sizeof(ti->title), "%s", de->d_name);
             char *dot = strrchr(ti->title, '.');
             if (dot) *dot = '\0';
-            /* Default artist/album = parent directory name */
-            snprintf(ti->artist, sizeof(ti->artist), "%s", dir_node->name);
-            snprintf(ti->album,  sizeof(ti->album),  "%s", dir_node->name);
+            /* Default artist/album = parent directory basename */
+            const char *dir_base = strrchr(dir_node->name, '/');
+            dir_base = dir_base ? dir_base + 1 : dir_node->name;
+            if (dir_base[0] == '\0') dir_base = "Unknown";
+            snprintf(ti->artist, sizeof(ti->artist), "%s", dir_base);
+            snprintf(ti->album,  sizeof(ti->album),  "%s", dir_base);
             ti->format = ext_to_fmt(de->d_name);
             /* Metadata (tags) are populated lazily by the decoder on first load. */
             node_add_child(dir_node, leaf);

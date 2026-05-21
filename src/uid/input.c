@@ -19,6 +19,10 @@
 #include <stdlib.h>
 #include <sys/epoll.h>
 #include <linux/input.h>
+#ifdef SIMULATE
+#include <sys/timerfd.h>
+#include <stdint.h>
+#endif
 
 #define MAX_INPUT_DEVS  16
 #define SWIPE_THRESHOLD 80
@@ -36,6 +40,11 @@ struct InputCtx {
     int       epoll_fd;
     InputDev  devs[MAX_INPUT_DEVS];
     int       n_devs;
+#ifdef SIMULATE
+    int       sim_tap_tfd;          /* timerfd polling the tap sidecar file */
+    char      sim_tap_path[512];    /* path to the .tap sidecar file */
+    uint32_t  sim_last_seq;         /* last processed tap sequence number */
+#endif
 };
 
 static int open_input_dev(InputCtx *ctx, const char *path, int epoll_fd)
@@ -66,10 +75,49 @@ InputCtx *input_open(int epoll_fd)
     if (!ctx) return NULL;
     ctx->epoll_fd = epoll_fd;
 
+#ifdef SIMULATE
+    ctx->sim_tap_tfd = -1;
+    /* Derive .tap path from EGEPOD_FB_FILE */
+    const char *fb = getenv("EGEPOD_FB_FILE");
+    if (!fb) fb = "/tmp/egepod_fb.raw";
+    snprintf(ctx->sim_tap_path, sizeof(ctx->sim_tap_path), "%s.tap", fb);
+
+    /* Create a timerfd that fires at 60 Hz to poll the tap file */
+    ctx->sim_tap_tfd = timerfd_create(CLOCK_MONOTONIC,
+                                      TFD_NONBLOCK | TFD_CLOEXEC);
+    if (ctx->sim_tap_tfd >= 0) {
+        struct itimerspec ts = {
+            .it_interval = {0, 16666667},   /* ~60 Hz */
+            .it_value    = {0, 16666667},
+        };
+        timerfd_settime(ctx->sim_tap_tfd, 0, &ts, NULL);
+        struct epoll_event ev = {
+            .events  = EPOLLIN,
+            .data.fd = ctx->sim_tap_tfd,
+        };
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ctx->sim_tap_tfd, &ev);
+
+        /* Sync seq to existing tap file so stale taps from a previous run
+         * are not re-processed on startup. */
+        {
+            int tapfd = open(ctx->sim_tap_path, O_RDONLY | O_CLOEXEC);
+            if (tapfd >= 0) {
+                struct { int32_t x, y; uint32_t seq; } ev2;
+                if (pread(tapfd, &ev2, sizeof(ev2), 0) == (ssize_t)sizeof(ev2))
+                    ctx->sim_last_seq = ev2.seq;
+                close(tapfd);
+            }
+        }
+
+        LOGI("input: sim tap polling active (%s)", ctx->sim_tap_path);
+    }
+#endif
+
     DIR *dp = opendir("/dev/input");
     if (!dp) {
-        LOGE("input: opendir(/dev/input): %s", strerror(errno));
-        free(ctx); return NULL;
+        LOGW("input: no /dev/input — hardware input unavailable in simulation");
+        LOGI("input: %d device(s) registered", ctx->n_devs);
+        return ctx;
     }
     struct dirent *de;
     while ((de = readdir(dp))) {
@@ -91,12 +139,38 @@ void input_close(InputCtx *ctx)
         epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, ctx->devs[i].fd, NULL);
         close(ctx->devs[i].fd);
     }
+#ifdef SIMULATE
+    if (ctx->sim_tap_tfd >= 0) {
+        epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, ctx->sim_tap_tfd, NULL);
+        close(ctx->sim_tap_tfd);
+    }
+#endif
     free(ctx);
 }
 
 InputEvt input_process_fd(InputCtx *ctx, int ready_fd)
 {
     InputEvt result = { .type = INPUT_NONE };
+
+#ifdef SIMULATE
+    /* Simulation: tap file polling via timerfd */
+    if (ready_fd == ctx->sim_tap_tfd && ctx->sim_tap_tfd >= 0) {
+        uint64_t exp; read(ctx->sim_tap_tfd, &exp, sizeof(exp));  /* drain */
+        struct { int32_t x, y; uint32_t seq; } ev;
+        int tapfd = open(ctx->sim_tap_path, O_RDONLY | O_CLOEXEC);
+        if (tapfd >= 0) {
+            if (pread(tapfd, &ev, sizeof(ev), 0) == (ssize_t)sizeof(ev) &&
+                ev.seq != ctx->sim_last_seq) {
+                ctx->sim_last_seq = ev.seq;
+                result.type = INPUT_TAP;
+                result.x    = ev.x;
+                result.y    = ev.y;
+            }
+            close(tapfd);
+        }
+        return result;
+    }
+#endif
 
     /* Find the device */
     InputDev *dev = NULL;

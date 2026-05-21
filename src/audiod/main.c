@@ -173,20 +173,18 @@ int main(void)
             if (fd == pfd[0]) {
                 uint8_t buf[64]; (void)read(pfd[0], buf, sizeof(buf)); /* drain */
                 uint32_t pos = player_get_position(player);
-                /* Monotonic guard: never send a position that goes backward,
-                 * except on track change (pos drops back near 0). */
-                if (pos != UINT32_MAX) {
-                    static uint32_t last_pos = UINT32_MAX;
-                    int is_track_reset = (last_pos != UINT32_MAX && pos + 2000 < last_pos);
-                    if (pos != last_pos && (pos > last_pos || is_track_reset ||
-                                           last_pos == UINT32_MAX)) {
-                        last_pos = pos;
-                        IpcMsg pm = { .type = EVT_POSITION };
-                        pm.param.position_ms = pos;
-                        for (int j = 0; j < n_clients; j++)
-                            if (clients[j] >= 0)
-                                send(clients[j], &pm, sizeof(pm), MSG_DONTWAIT);
-                    }
+                static uint32_t last_pos = UINT32_MAX;
+                if (pos == UINT32_MAX) {
+                    /* Not playing/paused: reset guard so the first tick of the
+                     * next track is always sent regardless of direction. */
+                    last_pos = UINT32_MAX;
+                } else if (pos != last_pos) {
+                    last_pos = pos;
+                    IpcMsg pm = { .type = EVT_POSITION };
+                    pm.param.position_ms = pos;
+                    for (int j = 0; j < n_clients; j++)
+                        if (clients[j] >= 0)
+                            send(clients[j], &pm, sizeof(pm), MSG_DONTWAIT);
                 }
                 continue;
             }

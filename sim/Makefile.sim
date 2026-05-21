@@ -22,7 +22,7 @@ LDFLAGS := -lpthread -lasound -lm
 
 OUT := out/sim
 
-all: $(OUT)/egepod_audiod $(OUT)/egepod_pwrd $(OUT)/egepod_uid $(OUT)/fb_viewer
+all: $(OUT)/egepod_audiod $(OUT)/egepod_pwrd $(OUT)/egepod_uid
 
 $(OUT):
 	mkdir -p $(OUT)

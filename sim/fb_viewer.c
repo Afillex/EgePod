@@ -1,14 +1,15 @@
 /* EgePod framebuffer viewer — macOS native SDL2, reads file-backed FB.
  *
- * The VM's egepod_uid mmaps /tmp/egepod_fb.raw (two RGBX8888 pages).
- * A sidecar file /tmp/egepod_fb.raw.page contains the active page index (0/1).
- * This viewer polls both files at 60 fps and blits the active page to a window.
+ * The VM's egepod_uid mmaps <fb_path> (two ARGB8888 pages, portrait 720×1280).
+ * Sidecar <fb_path>.page contains "<page_index> <flip_gen>\n".
+ * Sidecar <fb_path>.tap  is written on mouse click for click-forwarding to uid.
+ *
+ * Generation-gated rendering: texture is only re-uploaded and msync'd when
+ * uid commits a new frame (flip_gen changes).  Between renders the viewer
+ * presents the cached texture at 60 FPS with zero VirtioFS traffic.
  *
  * Build on macOS:
  *   clang sim/fb_viewer.c $(sdl2-config --cflags --libs) -O2 -o out/sim/fb_viewer_macos
- *
- * Run:
- *   ./out/sim/fb_viewer_macos [/path/to/egepod_fb.raw]
  */
 
 #if __has_include(<SDL2/SDL.h>)
@@ -26,24 +27,43 @@
 #include <unistd.h>
 #include <errno.h>
 
-#define FB_W         1080
-#define FB_H         2400
-#define SCALE        0.38f
+#define FB_W         720
+#define FB_H         1280
+#define SCALE        0.55f   /* window = 396 × 704 */
 #define TARGET_FPS   60
 
-static int read_page_index(const char *page_file)
+/* Read page index and generation counter from the sidecar file.
+ * Returns 1 if successfully parsed both fields, 0 otherwise. */
+static int read_page_info(const char *page_file, int *page_out, uint32_t *gen_out)
 {
     FILE *f = fopen(page_file, "r");
     if (!f) return 0;
-    int p = 0; fscanf(f, "%d", &p); fclose(f);
-    return (p == 1) ? 1 : 0;
+    int p = 0; uint32_t g = 0;
+    int ok = (fscanf(f, "%d %u", &p, &g) == 2);
+    fclose(f);
+    if (!ok) return 0;
+    *page_out = (p == 1) ? 1 : 0;
+    *gen_out  = g;
+    return 1;
+}
+
+static void write_tap(const char *tap_path, int fb_x, int fb_y)
+{
+    static uint32_t seq = 0;
+    struct { int32_t x, y; uint32_t seq; } ev = { fb_x, fb_y, ++seq };
+    int fd = open(tap_path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    ftruncate(fd, sizeof(ev));
+    pwrite(fd, &ev, sizeof(ev), 0);
+    close(fd);
 }
 
 int main(int argc, char **argv)
 {
     const char *fb_path = (argc > 1) ? argv[1] : "/tmp/egepod_fb.raw";
-    char page_path[512];
+    char page_path[512], tap_path[512];
     snprintf(page_path, sizeof(page_path), "%s.page", fb_path);
+    snprintf(tap_path,  sizeof(tap_path),  "%s.tap",  fb_path);
 
     size_t page_bytes = (size_t)FB_W * FB_H * 4;
     size_t total      = page_bytes * 2;
@@ -81,21 +101,18 @@ int main(int argc, char **argv)
     SDL_Renderer *ren = SDL_CreateRenderer(win, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     SDL_Texture  *tex = SDL_CreateTexture(ren,
-        SDL_PIXELFORMAT_ARGB8888,   /* matches 0xAARRGGBB uint32 on little-endian */
+        SDL_PIXELFORMAT_ARGB8888,
         SDL_TEXTUREACCESS_STREAMING,
         FB_W, FB_H);
 
-    SDL_SetWindowTitle(win, "EgePod  (Q = quit)");
-    printf("fb_viewer: window %dx%d (%.0f%% scale). Q = quit.\n",
+    SDL_SetWindowTitle(win, "EgePod  (Q = quit, click = tap)");
+    printf("fb_viewer: window %dx%d (%.0f%% scale). Q = quit, click = tap.\n",
            win_w, win_h, SCALE * 100.0f);
 
-    /* Row-copy buffer for vertical flip */
-    uint8_t *row_buf = malloc(FB_W * 4);
-    if (!row_buf) { fprintf(stderr, "fb_viewer: OOM\n"); return 1; }
-
     uint32_t ms_per_frame = 1000 / TARGET_FPS;
-    int last_page = -1;
-    int running = 1;
+    uint32_t last_gen     = UINT32_MAX;   /* force first upload */
+    int      last_page    = -1;
+    int      running      = 1;
 
     while (running) {
         uint32_t t0 = SDL_GetTicks();
@@ -106,21 +123,40 @@ int main(int argc, char **argv)
             if (e.type == SDL_KEYDOWN &&
                (e.key.keysym.sym == SDLK_q || e.key.keysym.sym == SDLK_ESCAPE))
                 running = 0;
+
+            if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+                int fb_x = (int)(e.button.x / SCALE);
+                int fb_y = (int)(e.button.y / SCALE);
+                if (fb_x < 0) fb_x = 0;
+                if (fb_y < 0) fb_y = 0;
+                if (fb_x >= FB_W) fb_x = FB_W - 1;
+                if (fb_y >= FB_H) fb_y = FB_H - 1;
+                write_tap(tap_path, fb_x, fb_y);
+                printf("fb_viewer: tap at FB (%d, %d)\n", fb_x, fb_y);
+            }
         }
 
-        int page = read_page_index(page_path);
+        int      page = last_page < 0 ? 0 : last_page;
+        uint32_t gen  = last_gen;
+        read_page_info(page_path, &page, &gen);
 
-        /* Only re-upload texture when the page flips (avoids tearing mid-render) */
-        if (page != last_page) {
+        /* Only re-fetch + re-upload when uid has committed a new frame.
+         * This limits VirtioFS msync traffic to the actual render rate (~5 Hz)
+         * instead of the display rate (60 Hz). */
+        if (gen != last_gen) {
+            /* Invalidate only the active front page — the back page is being
+             * drawn to and its intermediate state is irrelevant to display. */
+            msync((void *)(fb + (size_t)page * page_bytes), page_bytes, MS_INVALIDATE);
+
             const uint8_t *src = fb + (size_t)page * page_bytes;
             void *pixels; int pitch;
             SDL_LockTexture(tex, NULL, &pixels, &pitch);
-
             for (int row = 0; row < FB_H; row++)
                 memcpy((uint8_t *)pixels + row * pitch,
                        src + row * FB_W * 4, FB_W * 4);
-
             SDL_UnlockTexture(tex);
+
+            last_gen  = gen;
             last_page = page;
         }
 
@@ -132,7 +168,6 @@ int main(int argc, char **argv)
         if (elapsed < ms_per_frame) SDL_Delay(ms_per_frame - elapsed);
     }
 
-    free(row_buf);
     munmap(fb, total);
     close(fd);
     SDL_DestroyTexture(tex);

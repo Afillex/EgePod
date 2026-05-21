@@ -1,24 +1,21 @@
-/* 🖥️ Kiosk UI Engineer — framebuffer renderer.
+/* 🖥️ Kiosk UI Engineer — EgePod framebuffer renderer.
  *
- * Font: DejaVu Sans Bold via stb_truetype (EGEPOD_FONT_PATH or system path).
- * Falls back to font8x8 if no TTF is found.
+ * Minimal brand-grade UI, 720×1280, pure dark theme.
+ * Primary font: Nimbus Sans Bold (Helvetica-compatible, fonts-urw-base35).
+ * Falls back to Liberation Sans Bold → Ubuntu Bold → DejaVu Sans Bold.
  *
- * Layout (1080 × 2400, RGBX8888):
- *
- *   ┌──────────────────────────────────────┐  y=0
- *   │  EgePod                  🔋  14:32  │  header  h=100
- *   ├──────────────────────────────────────┤  y=100  accent stripe h=4
- *   │                                      │
- *   │         [album art 620×620]          │  y=120  centred
- *   │                                      │
- *   ├──────────────────────────────────────┤  y=760
- *   │           Title                      │  y=800  centered
- *   │        Artist — Album                │  y=860  centered
- *   ├──────────────────────────────────────┤  y=930
- *   │  0:42  [██████████░░░░░░░░]  5:11   │  progress bar  y=970
- *   ├──────────────────────────────────────┤  y=1040
- *   │        (|<)   ( ▶ )   (>|)          │  transport circles
- *   └──────────────────────────────────────┘  y=1280
+ * Layout (y-coords):
+ *   0 – 50    Status bar    (clock L, battery R)
+ *  50 – 110   Header        ("EGEPOD" wordmark, state label R)
+ * 110 – 111   1 px separator
+ * 130 – 650   Album art     (520×520, centred — vinyl-record placeholder)
+ * 680 – 720   Track title   (centred, bold, 28 px, ALL CAPS)
+ * 724 – 750   Artist / Alb  (centred, 17 px, muted)
+ * 768 – 772   Progress bar  (4 px, with scrub handle dot)
+ * 782 – 800   Timestamps    (elapsed L, duration R)
+ * 824 – 898   Transport     (shuffle · prev · play · next · repeat)
+ * 920 – 921   1 px separator
+ * 960+        Library info  (track count, format / sample-rate)
  */
 
 #define STB_TRUETYPE_IMPLEMENTATION
@@ -35,121 +32,133 @@
 #include <time.h>
 #include <math.h>
 
-/* ── colour palette ──────────────────────────────────────────────────────── */
-#define C_BG          0xFF0D0D1A
-#define C_SURFACE     0xFF141428
-#define C_PANEL       0xFF1C1C35
-#define C_ACCENT      0xFF6C63FF   /* violet */
-#define C_HIGHLIGHT   0xFFFF4D8B   /* pink   */
-#define C_TEXT_PRI    0xFFF0F0F0
-#define C_TEXT_SEC    0xFF8888AA
-#define C_TEXT_DIM    0xFF444466
-#define C_PROGRESS    0xFF6C63FF
-#define C_PROGRESS_BG 0xFF252540
-#define C_BTN_MAIN    0xFF6C63FF
-#define C_BTN_ALT     0xFF252540
+/* ── Palette ─────────────────────────────────────────────────────────────── */
+#define C_BG        0xFF0B0B0B   /* page background               */
+#define C_CARD      0xFF0F0F0F   /* album art card background     */
+#define C_SEP       0xFF1E1E1E   /* separator lines               */
+#define C_TEXT      0xFFF0F0F0   /* primary text (off-white)      */
+#define C_TEXT_2    0xFF787878   /* secondary — artist, battery   */
+#define C_TEXT_3    0xFF383838   /* muted — timestamps, labels    */
+#define C_PROG_BG   0xFF232323   /* progress track                */
+#define C_PROG_FG   0xFFE0E0E0   /* progress fill                 */
+#define C_VINYL_A   0xFF101010   /* groove trough                 */
+#define C_VINYL_B   0xFF191919   /* groove ridge                  */
+#define C_VINYL_LBL 0xFF1C1C1C   /* center label disc             */
+#define C_VINYL_HUB 0xFF080808   /* spindle hole                  */
 
-/* ── TrueType font state ─────────────────────────────────────────────────── */
+/* ── Layout constants ───────────────────────────────────────────────────── */
+#define W_FB    720
+#define H_FB    1280
+
+#define STATUS_H   50
+
+#define HDR_Y     (STATUS_H)
+#define HDR_H      60
+#define SEP_Y     (HDR_Y + HDR_H)      /* 110 */
+
+#define ART_Y     (SEP_Y + 20)         /* 130 */
+#define ART_SZ     520
+#define ART_X     ((W_FB - ART_SZ) / 2)     /* 100 */
+#define ART_CX    (ART_X + ART_SZ / 2)      /* 360 */
+#define ART_CY    (ART_Y + ART_SZ / 2)      /* 390 */
+#define ART_CARD_R 14   /* card corner radius */
+
+/* Vinyl geometry (relative to ART_CX, ART_CY) */
+#define VINYL_R      (ART_SZ / 2 - 8)    /* 252 */
+#define VINYL_LBL_R  (VINYL_R / 4)       /* 63  */
+#define VINYL_HUB_R    7
+
+/* Text rows */
+#define TITLE_Y   (ART_Y + ART_SZ + 30)  /* 680 */
+#define ARTIST_Y  (TITLE_Y + 44)          /* 724 */
+
+/* Progress */
+#define PROG_Y    (ARTIST_Y + 30 + 18)   /* 772 */
+#define PROG_H     4
+#define PROG_X     36
+#define PROG_W    (W_FB - PROG_X * 2)    /* 648 */
+#define TIME_Y    (PROG_Y + PROG_H + 10) /* 786 */
+
+/* Transport — must match render.h hit-test constants exactly */
+#define CTRL_Y    824
+#define CTRL_H     74
+#define CTRL_CY   (CTRL_Y + CTRL_H / 2)   /* 861 */
+
+#define BTN_SZ    50
+#define PLAY_SZ   72
+#define BTN_GAP   22
+/* Row: 50+22+50+22+72+22+50+22+50 = 360; margin = (720-360)/2 = 180 */
+#define BTN_M     180
+
+#define BTN_SHUFFLE_X  BTN_M
+#define BTN_PREV_X    (BTN_M + BTN_SZ + BTN_GAP)
+#define BTN_PLAY_X    (BTN_M + BTN_SZ*2 + BTN_GAP*2)
+#define BTN_NEXT_X    (BTN_M + BTN_SZ*2 + BTN_GAP*2 + PLAY_SZ + BTN_GAP)
+#define BTN_REPEAT_X  (BTN_M + BTN_SZ*3 + BTN_GAP*2 + PLAY_SZ + BTN_GAP*2)
+
+#define DIV2_Y    (CTRL_Y + CTRL_H + 22) /* 920 */
+#define LIB_Y     (DIV2_Y + 44)          /* 964 */
+
+/* ── TrueType font ──────────────────────────────────────────────────────── */
 static stbtt_fontinfo  g_font;
 static int             g_font_ok  = 0;
 static unsigned char  *g_font_buf = NULL;
 
-static const char *FONT_SEARCH[] = {
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+/* Priority list — Nimbus Sans Bold is metrically identical to Helvetica. */
+static const char *FONT_PATHS[] = {
+    "/usr/share/fonts/opentype/urw-base35/NimbusSans-Bold.otf",
+    "/usr/share/fonts/opentype/urw-base35/NimbusSansCond-Bold.otf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
     "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
     NULL
 };
 
 static void font_init(void)
 {
     if (g_font_ok) return;
-
-    const char *paths[16];
-    int n = 0;
+    const char *paths[24]; int n = 0;
     const char *env = getenv("EGEPOD_FONT_PATH");
-    if (env) paths[n++] = env;
-    for (int i = 0; FONT_SEARCH[i]; i++) paths[n++] = FONT_SEARCH[i];
-
+    if (env && env[0]) paths[n++] = env;
+    for (int i = 0; FONT_PATHS[i]; i++) paths[n++] = FONT_PATHS[i];
     for (int i = 0; i < n; i++) {
         FILE *f = fopen(paths[i], "rb");
         if (!f) continue;
-        fseek(f, 0, SEEK_END);
-        long sz = ftell(f);
-        rewind(f);
+        fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
         g_font_buf = malloc(sz);
         if (!g_font_buf) { fclose(f); continue; }
-        fread(g_font_buf, 1, sz, f);
+        if (fread(g_font_buf, 1, sz, f) != (size_t)sz) {
+            free(g_font_buf); g_font_buf = NULL; fclose(f); continue;
+        }
         fclose(f);
         if (stbtt_InitFont(&g_font, g_font_buf, 0)) {
             g_font_ok = 1;
-            LOGI("render: TrueType font loaded from %s", paths[i]);
+            LOGI("render: font %s", paths[i]);
             return;
         }
         free(g_font_buf); g_font_buf = NULL;
     }
-    LOGW("render: no TrueType font found, falling back to 8×8 bitmap");
+    LOGW("render: no TTF — 8×8 bitmap fallback");
 }
 
-/* ── pixel helpers ───────────────────────────────────────────────────────── */
-
-static inline void blend_pixel(uint32_t *fb, uint32_t stride,
+/* ── Pixel helpers ──────────────────────────────────────────────────────── */
+static inline void blend_pixel(uint32_t *buf, uint32_t stride,
                                 int px, int py, uint32_t fg, uint8_t alpha,
-                                int fb_w, int fb_h)
+                                int fw, int fh)
 {
-    if (px < 0 || py < 0 || px >= fb_w || py >= fb_h) return;
-    uint32_t bg  = fb[py * stride + px];
-    uint32_t fr  = (fg >> 16) & 0xFF, fg2 = (fg >> 8) & 0xFF, fb2 = fg & 0xFF;
-    uint32_t br  = (bg >> 16) & 0xFF, bg2 = (bg >> 8) & 0xFF, bb  = bg & 0xFF;
-    uint32_t a   = alpha;
-    uint32_t r   = (fr * a + br * (255 - a)) / 255;
-    uint32_t g   = (fg2 * a + bg2 * (255 - a)) / 255;
-    uint32_t b   = (fb2 * a + bb  * (255 - a)) / 255;
-    fb[py * stride + px] = 0xFF000000 | (r << 16) | (g << 8) | b;
+    if (px < 0 || py < 0 || px >= fw || py >= fh) return;
+    uint32_t bg = buf[(size_t)py * stride + px];
+    uint32_t a  = alpha;
+    uint32_t r  = ((fg>>16&0xFF)*a + (bg>>16&0xFF)*(255-a)) / 255;
+    uint32_t g  = ((fg>>8 &0xFF)*a + (bg>>8 &0xFF)*(255-a)) / 255;
+    uint32_t b  = ((fg    &0xFF)*a + (bg    &0xFF)*(255-a)) / 255;
+    buf[(size_t)py * stride + px] = 0xFF000000 | (r<<16) | (g<<8) | b;
 }
 
-/* Filled anti-aliased circle on raw fb buffer */
-static void buf_fill_circle(uint32_t *fb, uint32_t stride, int fb_w, int fb_h,
-                             int cx, int cy, int r, uint32_t colour)
-{
-    int r2 = r * r;
-    for (int dy = -r; dy <= r; dy++) {
-        int dx = (int)sqrtf((float)(r2 - dy * dy));
-        int y  = cy + dy;
-        if (y < 0 || y >= fb_h) continue;
-        int x0 = cx - dx < 0 ? 0 : cx - dx;
-        int x1 = cx + dx >= fb_w ? fb_w - 1 : cx + dx;
-        uint32_t *row = fb + (size_t)y * stride;
-        for (int x = x0; x <= x1; x++) row[x] = colour;
-    }
-}
-
-/* Ring (hollow circle) */
-static void buf_draw_ring(uint32_t *fb, uint32_t stride, int fb_w, int fb_h,
-                          int cx, int cy, int r_out, int thick, uint32_t colour)
-{
-    int r_in = r_out - thick;
-    if (r_in < 0) r_in = 0;
-    for (int dy = -r_out; dy <= r_out; dy++) {
-        int out_dx = (int)sqrtf((float)(r_out * r_out - dy * dy));
-        int in_dy  = (dy < -r_in) ? -r_in : (dy > r_in) ? r_in : dy;
-        int in_dx  = (r_in > 0) ? (int)sqrtf((float)(r_in * r_in - in_dy * in_dy)) : 0;
-        int y = cy + dy;
-        if (y < 0 || y >= fb_h) continue;
-        /* left segment */
-        for (int x = cx - out_dx; x < cx - in_dx; x++) {
-            if (x >= 0 && x < fb_w) fb[y * stride + x] = colour;
-        }
-        /* right segment */
-        for (int x = cx + in_dx + 1; x <= cx + out_dx; x++) {
-            if (x >= 0 && x < fb_w) fb[y * stride + x] = colour;
-        }
-    }
-}
-
-/* ── TTF draw helpers ────────────────────────────────────────────────────── */
-
+/* ── TTF rendering ──────────────────────────────────────────────────────── */
 static int ttf_str_width(const char *s, float px)
 {
     if (!g_font_ok) return (int)strlen(s) * 8;
@@ -157,21 +166,21 @@ static int ttf_str_width(const char *s, float px)
     int w = 0;
     for (const char *c = s; *c; c++) {
         int adv, lsb;
-        stbtt_GetCodepointHMetrics(&g_font, *c, &adv, &lsb);
+        stbtt_GetCodepointHMetrics(&g_font, (unsigned char)*c, &adv, &lsb);
         w += (int)(adv * scale);
         if (*(c+1))
-            w += (int)(stbtt_GetCodepointKernAdvance(&g_font, *c, *(c+1)) * scale);
+            w += (int)(stbtt_GetCodepointKernAdvance(&g_font,
+                        (unsigned char)*c, (unsigned char)*(c+1)) * scale);
     }
     return w;
 }
 
-static void ttf_draw(uint32_t *fb, uint32_t stride, int fb_w, int fb_h,
+static void ttf_draw(uint32_t *buf, uint32_t stride, int fw, int fh,
                      int x, int y, const char *s, uint32_t color, float px)
 {
     if (!g_font_ok) {
-        int scale = (int)(px / 8);
-        if (scale < 1) scale = 1;
-        font_draw_str(fb, stride, x, y - (int)(px * 0.8f), s, color, scale);
+        int sc = (int)(px / 8); if (sc < 1) sc = 1;
+        font_draw_str(buf, stride, x, y - (int)(px * 0.8f), s, color, sc);
         return;
     }
     float scale = stbtt_ScaleForPixelHeight(&g_font, px);
@@ -179,141 +188,204 @@ static void ttf_draw(uint32_t *fb, uint32_t stride, int fb_w, int fb_h,
     for (const char *c = s; *c; c++) {
         int bw, bh, bx, by;
         uint8_t *bm = stbtt_GetCodepointBitmap(&g_font, scale, scale,
-                                                *c, &bw, &bh, &bx, &by);
+                                                (unsigned char)*c, &bw, &bh, &bx, &by);
         for (int row = 0; row < bh; row++)
             for (int col = 0; col < bw; col++)
-                blend_pixel(fb, stride, cx + bx + col, y + by + row,
-                            color, bm[row * bw + col], fb_w, fb_h);
+                blend_pixel(buf, stride, cx+bx+col, y+by+row,
+                            color, bm[row*bw+col], fw, fh);
         stbtt_FreeBitmap(bm, NULL);
         int adv, lsb;
-        stbtt_GetCodepointHMetrics(&g_font, *c, &adv, &lsb);
+        stbtt_GetCodepointHMetrics(&g_font, (unsigned char)*c, &adv, &lsb);
         cx += (int)(adv * scale);
         if (*(c+1))
-            cx += (int)(stbtt_GetCodepointKernAdvance(&g_font, *c, *(c+1)) * scale);
+            cx += (int)(stbtt_GetCodepointKernAdvance(&g_font,
+                         (unsigned char)*c, (unsigned char)*(c+1)) * scale);
     }
 }
 
-static void ttf_centred(uint32_t *fb, uint32_t stride, int fb_w, int fb_h,
+static void ttf_centred(uint32_t *buf, uint32_t stride, int fw, int fh,
                         int x0, int x1, int y,
                         const char *s, uint32_t color, float px)
 {
     int w = ttf_str_width(s, px);
     int x = x0 + (x1 - x0 - w) / 2;
-    ttf_draw(fb, stride, fb_w, fb_h, x, y, s, color, px);
+    if (x < x0) x = x0;
+    ttf_draw(buf, stride, fw, fh, x, y, s, color, px);
 }
 
-static void ttf_right(uint32_t *fb, uint32_t stride, int fb_w, int fb_h,
-                      int x_right, int y,
-                      const char *s, uint32_t color, float px)
+static void ttf_right(uint32_t *buf, uint32_t stride, int fw, int fh,
+                      int xr, int y, const char *s, uint32_t color, float px)
 {
-    int w = ttf_str_width(s, px);
-    ttf_draw(fb, stride, fb_w, fb_h, x_right - w, y, s, color, px);
+    ttf_draw(buf, stride, fw, fh, xr - ttf_str_width(s, px), y, s, color, px);
 }
 
-/* ── icon drawing ────────────────────────────────────────────────────────── */
+/* ── Primitives ─────────────────────────────────────────────────────────── */
+static void buf_hline(uint32_t *buf, uint32_t stride, int x0, int x1, int y,
+                      uint32_t c, int fw, int fh)
+{
+    if (y < 0 || y >= fh) return;
+    for (int x = x0; x <= x1 && x < fw; x++)
+        if (x >= 0) buf[(size_t)y * stride + x] = c;
+}
 
-/* Right-pointing triangle (play). cx,cy = visual center. sz = half-height. */
-static void draw_icon_play(uint32_t *fb, uint32_t stride, int fb_w, int fb_h,
-                           int cx, int cy, int sz, uint32_t colour)
+static void buf_fill_rrect(uint32_t *buf, uint32_t stride, int fw, int fh,
+                           int x, int y, int w, int h, int r, uint32_t c)
+{
+    if (r < 1) {
+        for (int row = y; row < y+h && row < fh; row++) {
+            if (row < 0) continue;
+            uint32_t *line = buf + (size_t)row * stride;
+            for (int col = x; col < x+w && col < fw; col++)
+                if (col >= 0) line[col] = c;
+        }
+        return;
+    }
+    int r2 = r * r;
+    for (int row = 0; row < h; row++) {
+        int py = y + row;
+        if (py < 0 || py >= fh) continue;
+        int x0 = x, x1 = x + w - 1;
+        if (row < r) {
+            int dy = r - row, dx = (int)sqrtf((float)(r2 - dy*dy));
+            x0 = x + (r - dx); x1 = x + w - 1 - (r - dx);
+        } else if (row >= h - r) {
+            int dy = r - (h-1-row), dx = (int)sqrtf((float)(r2 - dy*dy));
+            x0 = x + (r - dx); x1 = x + w - 1 - (r - dx);
+        }
+        uint32_t *line = buf + (size_t)py * stride;
+        for (int col = x0; col <= x1 && col < fw; col++)
+            if (col >= 0) line[col] = c;
+    }
+}
+
+static void buf_fill_circle(uint32_t *buf, uint32_t stride, int fw, int fh,
+                             int cx, int cy, int r, uint32_t c)
+{
+    int r2 = r * r;
+    for (int dy = -r; dy <= r; dy++) {
+        int dx = (int)sqrtf((float)(r2 - dy*dy));
+        int py = cy + dy;
+        if (py < 0 || py >= fh) continue;
+        int px0 = cx-dx < 0 ? 0 : cx-dx;
+        int px1 = cx+dx >= fw ? fw-1 : cx+dx;
+        uint32_t *row = buf + (size_t)py * stride;
+        for (int px = px0; px <= px1; px++) row[px] = c;
+    }
+}
+
+/* ── Vinyl record art ───────────────────────────────────────────────────── */
+/* Renders a vinyl record texture into a circular region centred at (cx,cy).
+ * When playing: a small white dot orbits the centre label — subtle spin cue. */
+static void draw_vinyl(uint32_t *buf, uint32_t stride,
+                       int cx, int cy, PlayerState state)
+{
+    const int outer_r  = VINYL_R;
+    const int label_r  = VINYL_LBL_R;
+    const int hub_r    = VINYL_HUB_R;
+    const int gp       = 9;   /* groove pitch in pixels */
+
+    for (int dy = -outer_r; dy <= outer_r; dy++) {
+        int py = cy + dy;
+        if (py < 0 || py >= H_FB) continue;
+        int span = (int)sqrtf((float)(outer_r*outer_r - dy*dy));
+        uint32_t *row = buf + (size_t)py * stride;
+        for (int dx = -span; dx <= span; dx++) {
+            int px = cx + dx;
+            if (px < 0 || px >= W_FB) continue;
+            int r = (int)sqrtf((float)(dx*dx + dy*dy));
+            uint32_t c;
+            if      (r <= hub_r)   c = C_VINYL_HUB;
+            else if (r <= label_r) c = C_VINYL_LBL;
+            else                   c = ((r / gp) & 1) ? C_VINYL_B : C_VINYL_A;
+            row[px] = c;
+        }
+    }
+
+    if (state == PLAYER_PLAYING) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        double t     = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+        double angle = t * 1.2;   /* ~0.19 rps orbit */
+        int orbit_r  = label_r + 16;
+        int dot_cx   = cx + (int)((double)orbit_r * cos(angle));
+        int dot_cy   = cy + (int)((double)orbit_r * sin(angle));
+        buf_fill_circle(buf, stride, W_FB, H_FB, dot_cx, dot_cy, 4, C_TEXT);
+    }
+}
+
+/* ── Transport icons ────────────────────────────────────────────────────── */
+static void draw_triangle_right(uint32_t *buf, uint32_t stride,
+                                int cx, int cy, int sz, uint32_t c)
 {
     for (int dy = -sz; dy <= sz; dy++) {
         int w = sz - abs(dy);
-        int x0 = cx - sz / 3;
         for (int dx = 0; dx <= w; dx++) {
-            int px = x0 + dx, py = cy + dy;
-            if (px >= 0 && px < fb_w && py >= 0 && py < fb_h)
-                fb[py * stride + px] = colour;
+            int px = cx - sz/3 + dx, py = cy + dy;
+            if (px >= 0 && px < W_FB && py >= 0 && py < H_FB)
+                buf[(size_t)py * stride + px] = c;
         }
     }
 }
 
-/* Two vertical bars (pause). */
-static void draw_icon_pause(uint32_t *fb, uint32_t stride, int fb_w, int fb_h,
-                            int cx, int cy, int sz, uint32_t colour)
+static void draw_pause_bars(uint32_t *buf, uint32_t stride,
+                            int cx, int cy, int sz, uint32_t c)
 {
-    int bar_w = sz / 3, bar_h = sz * 2, gap = sz / 2;
-    int x0 = cx - gap / 2 - bar_w;
-    int x1 = cx + gap / 2;
-    int y0 = cy - sz;
-    for (int row = 0; row < bar_h; row++) {
+    int bw = sz/3, bh = sz*2, gap = sz/2;
+    int x0 = cx - gap/2 - bw, x1 = cx + gap/2, y0 = cy - sz;
+    for (int row = 0; row < bh; row++) {
         int y = y0 + row;
-        if (y < 0 || y >= fb_h) continue;
-        for (int col = 0; col < bar_w; col++) {
-            int px;
-            px = x0 + col;
-            if (px >= 0 && px < fb_w) fb[y * stride + px] = colour;
-            px = x1 + col;
-            if (px >= 0 && px < fb_w) fb[y * stride + px] = colour;
+        if (y < 0 || y >= H_FB) continue;
+        for (int col = 0; col < bw; col++) {
+            int p;
+            p = x0+col; if (p>=0 && p<W_FB) buf[(size_t)y*stride+p] = c;
+            p = x1+col; if (p>=0 && p<W_FB) buf[(size_t)y*stride+p] = c;
         }
     }
 }
 
-/* Skip-back icon: vertical bar + left triangle */
-static void draw_icon_prev(uint32_t *fb, uint32_t stride, int fb_w, int fb_h,
-                           int cx, int cy, int sz, uint32_t colour)
+/* |◄ — vertical bar + left-pointing triangle */
+static void draw_icon_prev(uint32_t *buf, uint32_t stride,
+                           int cx, int cy, int sz, uint32_t c)
 {
-    int bar_w = sz / 4, bar_h = sz * 2;
-    int x0    = cx - sz / 2 - bar_w / 2;
-    int y0    = cy - sz;
-    /* vertical bar */
-    for (int row = 0; row < bar_h; row++) {
-        int y = y0 + row;
-        if (y < 0 || y >= fb_h) continue;
-        for (int col = 0; col < bar_w; col++) {
-            int px = x0 + col;
-            if (px >= 0 && px < fb_w) fb[y * stride + px] = colour;
+    int bw = sz/4 + 1, bh = sz*2, bar_x = cx - sz/2 - bw, y0 = cy - sz;
+    for (int row = 0; row < bh; row++) {
+        int y = y0+row; if (y < 0 || y >= H_FB) continue;
+        for (int col = 0; col < bw; col++) {
+            int px = bar_x+col; if (px>=0 && px<W_FB) buf[(size_t)y*stride+px] = c;
         }
     }
-    /* left-pointing triangle */
-    int tri_cx = cx + bar_w / 2;
+    int tc = cx + bw/2;
+    for (int dy = -sz; dy <= sz; dy++) {
+        int w = sz - abs(dy), tx = tc - w;
+        for (int dx = 0; dx <= w; dx++) {
+            int px = tx+dx, py = cy+dy;
+            if (px>=0 && px<W_FB && py>=0 && py<H_FB) buf[(size_t)py*stride+px] = c;
+        }
+    }
+}
+
+/* ►| — right-pointing triangle + vertical bar */
+static void draw_icon_next(uint32_t *buf, uint32_t stride,
+                           int cx, int cy, int sz, uint32_t c)
+{
+    int bw = sz/4 + 1, bh = sz*2, bar_x = cx + sz/2, y0 = cy - sz;
+    for (int row = 0; row < bh; row++) {
+        int y = y0+row; if (y < 0 || y >= H_FB) continue;
+        for (int col = 0; col < bw; col++) {
+            int px = bar_x+col; if (px>=0 && px<W_FB) buf[(size_t)y*stride+px] = c;
+        }
+    }
+    int tc = cx - bw/2 - sz/3;
     for (int dy = -sz; dy <= sz; dy++) {
         int w = sz - abs(dy);
-        int tx0 = tri_cx - w;
         for (int dx = 0; dx <= w; dx++) {
-            int px = tx0 + dx, py = cy + dy;
-            if (px >= 0 && px < fb_w && py >= 0 && py < fb_h)
-                fb[py * stride + px] = colour;
+            int px = tc+dx, py = cy+dy;
+            if (px>=0 && px<W_FB && py>=0 && py<H_FB) buf[(size_t)py*stride+px] = c;
         }
     }
 }
 
-/* Skip-next icon: right triangle + vertical bar */
-static void draw_icon_next(uint32_t *fb, uint32_t stride, int fb_w, int fb_h,
-                           int cx, int cy, int sz, uint32_t colour)
-{
-    int bar_w = sz / 4, bar_h = sz * 2;
-    int x0    = cx + sz / 2 - bar_w / 2;
-    int y0    = cy - sz;
-    /* vertical bar */
-    for (int row = 0; row < bar_h; row++) {
-        int y = y0 + row;
-        if (y < 0 || y >= fb_h) continue;
-        for (int col = 0; col < bar_w; col++) {
-            int px = x0 + col;
-            if (px >= 0 && px < fb_w) fb[y * stride + px] = colour;
-        }
-    }
-    /* right-pointing triangle */
-    int tri_cx = cx - bar_w / 2;
-    for (int dy = -sz; dy <= sz; dy++) {
-        int w = sz - abs(dy);
-        int tx0 = tri_cx - sz / 3;
-        for (int dx = 0; dx <= w; dx++) {
-            int px = tx0 + dx, py = cy + dy;
-            if (px >= 0 && px < fb_w && py >= 0 && py < fb_h)
-                fb[py * stride + px] = colour;
-        }
-    }
-}
-
-/* ── misc helpers ────────────────────────────────────────────────────────── */
-
-static void ms_to_str(uint32_t ms, char *buf, size_t len)
-{
-    uint32_t sec = ms / 1000;
-    snprintf(buf, len, "%u:%02u", sec / 60, sec % 60);
-}
-
+/* ── String helpers ─────────────────────────────────────────────────────── */
 static void trunc_str(const char *src, char *dst, size_t max_chars)
 {
     size_t n = strlen(src);
@@ -321,187 +393,305 @@ static void trunc_str(const char *src, char *dst, size_t max_chars)
         memcpy(dst, src, n + 1);
     } else {
         memcpy(dst, src, max_chars - 2);
-        dst[max_chars - 2] = '.';
-        dst[max_chars - 1] = '.';
-        dst[max_chars]     = '\0';
+        dst[max_chars-2] = '.'; dst[max_chars-1] = '.'; dst[max_chars] = '\0';
     }
 }
 
-/* Horizontal gradient fill: left colour → right colour */
-static void fill_rect_grad(uint32_t *fb, uint32_t stride, int fb_w, int fb_h,
-                            int x, int y, int w, int h,
-                            uint32_t c0, uint32_t c1)
+static void str_upper(const char *src, char *dst, size_t max)
 {
-    for (int row = y; row < y + h && row < fb_h; row++) {
-        uint32_t *line = fb + (size_t)row * stride;
-        for (int col = x; col < x + w && col < fb_w; col++) {
-            if (col < 0) continue;
-            int t = (col - x) * 255 / (w > 1 ? w - 1 : 1);
-            uint32_t r = ((c0 >> 16 & 0xFF) * (255 - t) + (c1 >> 16 & 0xFF) * t) / 255;
-            uint32_t g = ((c0 >> 8  & 0xFF) * (255 - t) + (c1 >> 8  & 0xFF) * t) / 255;
-            uint32_t b = ((c0       & 0xFF) * (255 - t) + (c1       & 0xFF) * t) / 255;
-            line[col] = 0xFF000000 | (r << 16) | (g << 8) | b;
+    size_t i;
+    for (i = 0; i+1 < max && src[i]; i++)
+        dst[i] = (src[i] >= 'a' && src[i] <= 'z') ? (char)(src[i]-32) : src[i];
+    dst[i] = '\0';
+}
+
+static void format_time(char *buf, size_t n, uint32_t ms)
+{
+    uint32_t s = ms / 1000;
+    snprintf(buf, n, "%d:%02d", (int)(s/60), (int)(s%60));
+}
+
+/* ── Library view ───────────────────────────────────────────────────────── */
+static void render_library(uint32_t *buf, uint32_t stride, const UiState *st)
+{
+    /* Background */
+    buf_fill_rrect(buf, stride, W_FB, H_FB, 0, 0, W_FB, H_FB, 0, C_BG);
+
+    /* Status bar */
+    {
+        time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
+        char clk[8]; snprintf(clk, sizeof(clk), "%02d:%02d", tm.tm_hour, tm.tm_min);
+        int sy = STATUS_H - 10;
+        ttf_draw(buf, stride, W_FB, H_FB, 28, sy, clk, C_TEXT_2, 16.0f);
+        char bat[8]; snprintf(bat, sizeof(bat), "%u%%", st->battery_pct);
+        ttf_right(buf, stride, W_FB, H_FB, W_FB-28, sy, bat, C_TEXT_2, 16.0f);
+    }
+
+    /* Header: wordmark + track count, "BACK" hint */
+    {
+        int hy = HDR_Y + HDR_H - 12;
+        ttf_draw(buf, stride, W_FB, H_FB, 28, hy, "LIBRARY", C_TEXT, 30.0f);
+        char cnt[24];
+        if (st->library_loaded > 0)
+            snprintf(cnt, sizeof(cnt), "%u / %u", st->library_loaded, st->track_count);
+        else
+            snprintf(cnt, sizeof(cnt), "LOADING");
+        ttf_right(buf, stride, W_FB, H_FB, W_FB-28, hy, cnt, C_TEXT_3, 14.0f);
+    }
+    buf_hline(buf, stride, 0, W_FB-1, SEP_Y, C_SEP, W_FB, H_FB);
+
+    /* Track rows — show all known tracks; use placeholders for unloaded metadata */
+    int row_y0 = SEP_Y + 4;
+    uint32_t loaded = st->library_loaded;
+    uint32_t total  = st->track_count;
+    int      scroll = st->lib_scroll;
+
+    for (int i = 0; i < UI_LIB_VISIBLE; i++) {
+        int idx = scroll + i;
+        if (idx < 0 || (uint32_t)idx >= total || idx >= MAX_LIB_TRACKS) break;
+
+        int ry = row_y0 + i * UI_LIB_ROW_H;
+
+        /* Accent bar for currently playing track */
+        if ((uint32_t)idx == st->cur_track_idx)
+            buf_fill_rrect(buf, stride, W_FB, H_FB, 0, ry, 3, UI_LIB_ROW_H - 2, 0, C_PROG_FG);
+
+        if ((uint32_t)idx < loaded) {
+            const LibEntry *e = &st->library[idx];
+
+            /* Title */
+            char title[48]; trunc_str(e->title[0] ? e->title : "Unknown", title, 28);
+            ttf_draw(buf, stride, W_FB, H_FB, 24, ry + 28, title, C_TEXT, 18.0f);
+
+            /* Artist */
+            char artist[40]; trunc_str(e->artist[0] ? e->artist : "Unknown Artist", artist, 24);
+            ttf_draw(buf, stride, W_FB, H_FB, 24, ry + 54, artist, C_TEXT_2, 13.0f);
+
+            /* Duration (right-aligned) */
+            if (e->duration_ms > 0) {
+                char dur[10]; format_time(dur, sizeof(dur), e->duration_ms);
+                ttf_right(buf, stride, W_FB, H_FB, W_FB-20, ry + 28, dur, C_TEXT_3, 13.0f);
+            }
+        } else {
+            /* Metadata not yet fetched — show a numbered placeholder */
+            char ph[24]; snprintf(ph, sizeof(ph), "Track %d", idx + 1);
+            ttf_draw(buf, stride, W_FB, H_FB, 24, ry + 28, ph, C_TEXT_3, 18.0f);
         }
+
+        /* Row separator */
+        buf_hline(buf, stride, 20, W_FB-20, ry + UI_LIB_ROW_H - 1, C_SEP, W_FB, H_FB);
+    }
+
+    /* Scrollbar (3 px right edge) */
+    if (loaded > (uint32_t)UI_LIB_VISIBLE) {
+        int bar_h = H_FB - SEP_Y;
+        int thumb_h = bar_h * UI_LIB_VISIBLE / (int)loaded;
+        if (thumb_h < 24) thumb_h = 24;
+        int thumb_y = SEP_Y + (int)((int64_t)scroll * (bar_h - thumb_h) /
+                                    ((int)loaded - UI_LIB_VISIBLE));
+        buf_fill_rrect(buf, stride, W_FB, H_FB, W_FB-4, thumb_y, 3, thumb_h, 1, C_TEXT_3);
     }
 }
 
-/* ── render_frame ────────────────────────────────────────────────────────── */
-
+/* ── render_frame ───────────────────────────────────────────────────────── */
 void render_frame(FbCtx *fb, const UiState *st)
 {
     font_init();
 
     uint32_t *buf    = fb_back(fb);
     uint32_t  stride = fb->stride / sizeof(uint32_t);
-    int       W      = (int)fb->width;
-    int       H      = (int)fb->height;
 
-    /* ── background ── */
+    if (st->lib_mode) {
+        render_library(buf, stride, st);
+        return;
+    }
+
+    /* ── Background ── */
     fb_clear(fb, C_BG);
 
-    /* ── header ── */
+    /* ── Status bar ── */
     {
-        int hdr_h = 100;
-        fb_fill_rect(fb, 0, 0, W, hdr_h, C_SURFACE);
+        time_t t = time(NULL);
+        struct tm tm; localtime_r(&t, &tm);
+        char clk[8]; snprintf(clk, sizeof(clk), "%02d:%02d", tm.tm_hour, tm.tm_min);
+        int sy = STATUS_H - 10;
+        ttf_draw(buf, stride, W_FB, H_FB, 28, sy, clk, C_TEXT_2, 16.0f);
+        char bat[8]; snprintf(bat, sizeof(bat), "%u%%", st->battery_pct);
+        ttf_right(buf, stride, W_FB, H_FB, W_FB-28, sy, bat, C_TEXT_2, 16.0f);
+    }
 
-        /* App name */
-        ttf_draw(buf, stride, W, H, 44, 70, "EgePod", C_TEXT_PRI, 50.0f);
+    /* ── Header — "EGEPOD" wordmark + state label ── */
+    {
+        int hy = HDR_Y + HDR_H - 12;
+        ttf_draw(buf, stride, W_FB, H_FB, 28, hy, "EGEPOD", C_TEXT, 30.0f);
 
-        /* Battery */
-        char batt[16];
-        snprintf(batt, sizeof(batt), "BAT %u%%", st->battery_pct);
-        ttf_right(buf, stride, W, H, W - 44, 52, batt, C_TEXT_SEC, 26.0f);
-
-        /* Clock */
-        {
-            time_t t = time(NULL);
-            struct tm tm;
-            localtime_r(&t, &tm);
-            char clk[8];
-            snprintf(clk, sizeof(clk), "%02d:%02d", tm.tm_hour, tm.tm_min);
-            ttf_right(buf, stride, W, H, W - 44, 88, clk, C_TEXT_PRI, 34.0f);
+        const char *state_str;
+        uint32_t    sc;
+        switch (st->state) {
+        case PLAYER_PLAYING: state_str = "PLAYING"; sc = C_TEXT_2; break;
+        case PLAYER_PAUSED:  state_str = "PAUSED";  sc = C_TEXT_3; break;
+        case PLAYER_LOADING: state_str = "LOADING"; sc = C_TEXT_3; break;
+        default:             state_str = "IDLE";    sc = C_TEXT_3; break;
         }
-
-        /* Accent stripe */
-        fb_fill_rect(fb, 0, hdr_h, W, 4, C_ACCENT);
+        ttf_right(buf, stride, W_FB, H_FB, W_FB-28, hy, state_str, sc, 14.0f);
     }
 
-    /* ── album art ── */
+    /* ── Separator ── */
+    buf_hline(buf, stride, 0, W_FB-1, SEP_Y, C_SEP, W_FB, H_FB);
+
+    /* ── Album art card + vinyl ── */
+    buf_fill_rrect(buf, stride, W_FB, H_FB, ART_X, ART_Y, ART_SZ, ART_SZ,
+                   ART_CARD_R, C_CARD);
+    draw_vinyl(buf, stride, ART_CX, ART_CY, st->state);
+
+    /* ── Track title (ALL CAPS) ── */
     {
-        int art_size = 620;
-        int art_x    = (W - art_size) / 2;
-        int art_y    = 124;
-        int brd      = 4;
-
-        /* Outer glow ring */
-        buf_draw_ring(buf, stride, W, H,
-                      art_x + art_size / 2, art_y + art_size / 2,
-                      art_size / 2 + 8, 3, C_ACCENT);
-
-        /* Border */
-        fb_fill_rect(fb, art_x,        art_y,        art_size, art_size, C_ACCENT);
-        /* Panel fill */
-        fb_fill_rect(fb, art_x + brd,  art_y + brd,
-                     art_size - brd*2, art_size - brd*2, C_PANEL);
-
-        /* Decorative inner ring */
-        buf_draw_ring(buf, stride, W, H,
-                      art_x + art_size / 2, art_y + art_size / 2,
-                      art_size / 2 - 20, 2, C_TEXT_DIM);
-
-        /* "NO COVER" label */
-        ttf_centred(buf, stride, W, H, art_x, art_x + art_size,
-                    art_y + art_size / 2 + 14, "NO COVER", C_TEXT_DIM, 30.0f);
+        const char *raw = st->track.title[0] ? st->track.title : "NO TRACK";
+        char tmp[36], title[36];
+        trunc_str(raw, tmp, 28);
+        str_upper(tmp, title, sizeof(title));
+        ttf_centred(buf, stride, W_FB, H_FB, 24, W_FB-24, TITLE_Y,
+                    title, C_TEXT, 28.0f);
     }
 
-    /* ── track info ── */
+    /* ── Artist / Album subtitle ── */
     {
-        int info_y = 800;
-        char title[52], artist[36], album[36], sub[80];
-        const char *t = st->track.title[0]  ? st->track.title  : "No Track";
         const char *a = st->track.artist[0] ? st->track.artist : "Unknown Artist";
-        const char *l = st->track.album[0]  ? st->track.album  : "Unknown Album";
-        trunc_str(t, title,  48);
-        trunc_str(a, artist, 32);
-        trunc_str(l, album,  32);
-        snprintf(sub, sizeof(sub), "%s  \xe2\x80\x94  %s", artist, album);
-
-        ttf_centred(buf, stride, W, H, 40, W - 40, info_y,
-                    title, C_TEXT_PRI, 52.0f);
-        ttf_centred(buf, stride, W, H, 40, W - 40, info_y + 72,
-                    sub, C_TEXT_SEC, 30.0f);
+        const char *l = st->track.album[0]  ? st->track.album  : "";
+        char sub[72];
+        if (l[0] && strcmp(a, l) != 0)
+            snprintf(sub, sizeof(sub), "%s / %s", a, l);
+        else
+            snprintf(sub, sizeof(sub), "%s", a);
+        char disp[48];
+        trunc_str(sub, disp, 40);
+        ttf_centred(buf, stride, W_FB, H_FB, 24, W_FB-24, ARTIST_Y,
+                    disp, C_TEXT_2, 16.0f);
     }
 
-    /* ── progress bar ── */
+    /* ── Progress bar + scrub dot ── */
     {
-        int bar_x = 60, bar_y = 990, bar_w = W - 120, bar_h = 8;
+        buf_fill_rrect(buf, stride, W_FB, H_FB, PROG_X, PROG_Y,
+                       PROG_W, PROG_H, PROG_H/2, C_PROG_BG);
 
-        /* Time labels */
-        char pos_s[8], dur_s[8];
-        ms_to_str(st->position_ms,       pos_s, sizeof(pos_s));
-        ms_to_str(st->track.duration_ms, dur_s, sizeof(dur_s));
-        ttf_draw (buf, stride, W, H, bar_x,          bar_y - 32, pos_s, C_TEXT_SEC, 28.0f);
-        ttf_right(buf, stride, W, H, bar_x + bar_w,  bar_y - 32, dur_s, C_TEXT_SEC, 28.0f);
+        if (st->track.duration_ms > 0) {
+            /* Single formula for fill and dot so they always share the same x. */
+            int filled = (int)((uint64_t)st->position_ms * PROG_W
+                               / st->track.duration_ms);
+            if (filled < 0)      filled = 0;
+            if (filled > PROG_W) filled = PROG_W;
 
-        /* Track: rounded ends by overdrawing */
-        fb_fill_rect(fb, bar_x, bar_y - 1, bar_w, bar_h + 2, C_PROGRESS_BG);
-        fb_fill_rect(fb, bar_x, bar_y,     bar_w, bar_h,     C_PROGRESS_BG);
+            if (filled > 0)
+                buf_fill_rrect(buf, stride, W_FB, H_FB, PROG_X, PROG_Y,
+                               filled, PROG_H, PROG_H/2, C_PROG_FG);
 
-        uint32_t dur = st->track.duration_ms;
-        if (dur > 0 && st->position_ms <= dur) {
-            int filled = (int)((uint64_t)st->position_ms * bar_w / dur);
-            if (filled > 0) {
-                /* Gradient fill: accent → highlight */
-                fill_rect_grad(buf, stride, W, H,
-                               bar_x, bar_y, filled, bar_h,
-                               C_ACCENT, C_HIGHLIGHT);
-            }
-            /* Playhead dot */
-            int dot_cx = bar_x + (filled > 0 ? filled : 0);
-            int dot_cy = bar_y + bar_h / 2;
-            buf_fill_circle(buf, stride, W, H, dot_cx, dot_cy, 12, C_HIGHLIGHT);
-            buf_fill_circle(buf, stride, W, H, dot_cx, dot_cy,  6, C_TEXT_PRI);
+            buf_fill_circle(buf, stride, W_FB, H_FB,
+                            PROG_X + filled, PROG_Y + PROG_H/2, 5, C_TEXT);
         }
     }
 
-    /* ── transport controls ── */
+    /* ── Timestamps ── */
     {
-        int btn_y    = 1155;        /* circle centers */
-        int cx       = W / 2;
-        int spacing  = 220;
-
-        /* PREV button: mid-size ring + icon */
-        int prev_cx = cx - spacing;
-        int next_cx = cx + spacing;
-        int r_side  = 62;
-        int r_main  = 80;
-
-        /* Side button backgrounds */
-        buf_fill_circle(buf, stride, W, H, prev_cx, btn_y, r_side, C_BTN_ALT);
-        buf_draw_ring  (buf, stride, W, H, prev_cx, btn_y, r_side, 3, C_ACCENT);
-        buf_fill_circle(buf, stride, W, H, next_cx, btn_y, r_side, C_BTN_ALT);
-        buf_draw_ring  (buf, stride, W, H, next_cx, btn_y, r_side, 3, C_ACCENT);
-
-        /* Main play/pause background */
-        buf_fill_circle(buf, stride, W, H, cx, btn_y, r_main, C_BTN_MAIN);
-
-        /* Icons */
-        draw_icon_prev(buf, stride, W, H, prev_cx, btn_y, 24, C_ACCENT);
-        draw_icon_next(buf, stride, W, H, next_cx, btn_y, 24, C_ACCENT);
-
-        if (st->state == PLAYER_PLAYING)
-            draw_icon_pause(buf, stride, W, H, cx, btn_y, 28, C_BG);
+        char elapsed[10], total[10];
+        format_time(elapsed, sizeof(elapsed), st->position_ms);
+        if (st->track.duration_ms > 0)
+            format_time(total, sizeof(total), st->track.duration_ms);
         else
-            draw_icon_play (buf, stride, W, H, cx, btn_y, 28, C_BG);
+            snprintf(total, sizeof(total), "--:--");
+        ttf_draw(buf, stride, W_FB, H_FB,
+                 PROG_X, TIME_Y, elapsed, C_TEXT_3, 13.0f);
+        ttf_right(buf, stride, W_FB, H_FB,
+                  PROG_X + PROG_W, TIME_Y, total, C_TEXT_3, 13.0f);
     }
 
-    /* ── state overlay ── */
-    if (st->state == PLAYER_LOADING) {
-        ttf_centred(buf, stride, W, H, 0, W, 1340, "Loading...", C_TEXT_SEC, 34.0f);
-    } else if (st->state == PLAYER_ERROR) {
-        ttf_centred(buf, stride, W, H, 0, W, 1340, "! Playback Error", C_HIGHLIGHT, 34.0f);
-    } else if (st->state == PLAYER_IDLE) {
-        ttf_centred(buf, stride, W, H, 0, W, 1340,
-                    "Tap play to start", C_TEXT_DIM, 30.0f);
+    /* ── Transport controls ── */
+    {
+        int cy = CTRL_CY;
+
+        /* Shuffle — text label */
+        ttf_centred(buf, stride, W_FB, H_FB,
+                    BTN_SHUFFLE_X, BTN_SHUFFLE_X + BTN_SZ,
+                    cy + 6, "SH", C_TEXT_3, 13.0f);
+
+        /* Prev ◄| */
+        draw_icon_prev(buf, stride, BTN_PREV_X + BTN_SZ/2, cy, 12, C_TEXT_2);
+
+        /* Play / Pause — white disc + dark icon */
+        {
+            int pcx = BTN_PLAY_X + PLAY_SZ/2;
+            buf_fill_circle(buf, stride, W_FB, H_FB, pcx, cy, PLAY_SZ/2, C_TEXT);
+            if (st->state == PLAYER_PLAYING)
+                draw_pause_bars(buf, stride, pcx, cy, 10, C_BG);
+            else
+                draw_triangle_right(buf, stride, pcx+2, cy, 12, C_BG);
+        }
+
+        /* Next |► */
+        draw_icon_next(buf, stride, BTN_NEXT_X + BTN_SZ/2, cy, 12, C_TEXT_2);
+
+        /* Repeat — text label */
+        ttf_centred(buf, stride, W_FB, H_FB,
+                    BTN_REPEAT_X, BTN_REPEAT_X + BTN_SZ,
+                    cy + 6, "RP", C_TEXT_3, 13.0f);
+    }
+
+    /* ── Second separator ── */
+    buf_hline(buf, stride, 0, W_FB-1, DIV2_Y, C_SEP, W_FB, H_FB);
+
+    /* ── Library info ── */
+    {
+        char lib[40];
+        if (st->track_count > 0)
+            snprintf(lib, sizeof(lib), "%u TRACKS IN LIBRARY", st->track_count);
+        else
+            snprintf(lib, sizeof(lib), "SCANNING LIBRARY");
+        ttf_centred(buf, stride, W_FB, H_FB, 0, W_FB, LIB_Y, lib, C_TEXT_3, 14.0f);
+
+        /* Format / quality line */
+        if (st->track.path[0]) {
+            const char *fmt = "";
+            switch (st->track.format) {
+            case FMT_FLAC: fmt = "FLAC"; break;
+            case FMT_WAV:  fmt = "WAV";  break;
+            case FMT_MP3:  fmt = "MP3";  break;
+            default: break;
+            }
+            char qual[48] = {0};
+            if (fmt[0] && st->track.sample_rate > 0) {
+                snprintf(qual, sizeof(qual), "%s  \xB7  %u kHz",
+                         fmt, st->track.sample_rate / 1000);
+                if (st->track.bits_per_sample > 0) {
+                    char bps[16];
+                    snprintf(bps, sizeof(bps), "  \xB7  %u-BIT",
+                             st->track.bits_per_sample);
+                    strncat(qual, bps, sizeof(qual)-strlen(qual)-1);
+                }
+            } else if (fmt[0]) {
+                snprintf(qual, sizeof(qual), "%s", fmt);
+            }
+            if (qual[0])
+                ttf_centred(buf, stride, W_FB, H_FB, 0, W_FB,
+                            LIB_Y + 34, qual, C_TEXT_3, 12.0f);
+        }
+    }
+
+    /* ── Brightness bar ── */
+    {
+        buf_hline(buf, stride, 0, W_FB-1, UI_BRIGHT_Y - 12, C_SEP, W_FB, H_FB);
+        int bar_cy = UI_BRIGHT_Y + 25;  /* fixed visual center, independent of hit-zone H */
+        /* Sun symbol */
+        buf_fill_circle(buf, stride, W_FB, H_FB, UI_BRIGHT_X - 18, bar_cy, 5, C_TEXT_3);
+        /* Track */
+        buf_fill_rrect(buf, stride, W_FB, H_FB, UI_BRIGHT_X, bar_cy - 2,
+                       UI_BRIGHT_W, 4, 2, C_PROG_BG);
+        /* Fill */
+        int bfill = (int)((uint64_t)st->brightness * (uint64_t)(UI_BRIGHT_W - 2) / 100);
+        if (bfill > 0)
+            buf_fill_rrect(buf, stride, W_FB, H_FB, UI_BRIGHT_X + 1, bar_cy - 2,
+                           bfill, 4, 2, C_TEXT_3);
+        /* Handle dot */
+        int bdot_x = UI_BRIGHT_X +
+                     (int)((uint64_t)st->brightness * (uint64_t)UI_BRIGHT_W / 100);
+        buf_fill_circle(buf, stride, W_FB, H_FB, bdot_x, bar_cy, 5, C_TEXT_2);
     }
 }

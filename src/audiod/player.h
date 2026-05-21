@@ -16,7 +16,7 @@ IpcMsg  player_handle_cmd(Player *p, const IpcMsg *cmd);
 
 /* Must be called periodically (~1 Hz) to push EVT_POSITION to subscribers.
  * Returns position_ms, or UINT32_MAX if not playing. */
-uint32_t player_get_position(const Player *p);
+uint32_t player_get_position(Player *p);
 
 /* Subscribe a client fd to receive unsolicited events (track change, position).
  * Returns 0 on success. */
