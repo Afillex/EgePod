@@ -25,9 +25,10 @@
 #include <sys/socket.h>
 #include <sched.h>
 
-#define ALSA_CARD    0
-#define ALSA_DEVICE  0
-#define MUSIC_DIR    "/sdcard/Music"
+#define ALSA_CARD      0
+#define ALSA_DEVICE    0
+#define MUSIC_DIR      "/sdcard/Music"
+#define PERIOD_FRAMES  4096u   /* PCM frames per playback write (~93ms @ 44.1kHz) */
 
 /* ── types ─────────────────────────────────────────────────────────────── */
 
@@ -80,6 +81,7 @@ struct Player {
 
 /* ── forward declarations ──────────────────────────────────────────────────── */
 static uint32_t get_pos_nolock(const Player *p);
+static void     setup_prefetch_thread(void);
 
 /* ── helpers ───────────────────────────────────────────────────────────── */
 
@@ -139,6 +141,7 @@ static void publish_track(Player *p)
 static void *prefetch_thread(void *arg)
 {
     Player *p = arg;
+    setup_prefetch_thread();
     while (!p->quit) {
         pthread_mutex_lock(&p->lock);
         /* Wait until told to load the next track */
@@ -174,6 +177,14 @@ static void *prefetch_thread(void *arg)
 }
 
 /* ── playback thread ───────────────────────────────────────────────────── */
+
+/* Background decode should only consume idle cycles — never preempt audio. */
+static void setup_prefetch_thread(void)
+{
+    struct sched_param sp = { .sched_priority = 0 };
+    if (pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp) != 0)
+        LOGW("player: SCHED_IDLE unavailable for prefetch (need kernel support)");
+}
 
 /* Pin this thread to CPU1 (first A55) at SCHED_FIFO priority 50. */
 static void setup_rt_playback_thread(void)
@@ -288,8 +299,6 @@ static void *playback_thread(void *arg)
     Player *p = arg;
     setup_rt_playback_thread();
 
-    const size_t PERIOD_FRAMES = 4096;
-
     while (!p->quit) {
         pthread_mutex_lock(&p->lock);
         /* Close ALSA when not playing — only this thread touches p->alsa, so
@@ -342,9 +351,10 @@ static void *playback_thread(void *arg)
         }
 
         size_t chunk = (remaining < PERIOD_FRAMES) ? remaining : PERIOD_FRAMES;
-        /* Copy PCM to stack before dropping the lock — prevents use-after-free
-         * if CMD_NEXT/PREV calls pcmbuf_free while we are writing. */
-        int16_t  pcm_local[PERIOD_FRAMES * 2];
+        /* Copy PCM before dropping the lock — prevents use-after-free if
+         * CMD_NEXT/PREV calls pcmbuf_free mid-write.  static is safe: exactly
+         * one playback thread exists, so there is no reentrancy concern. */
+        static int16_t  pcm_local[PERIOD_FRAMES * 2];
         memcpy(pcm_local,
                p->cur_buf.pcm + p->cur_frame * p->cur_buf.channels,
                chunk * p->cur_buf.channels * sizeof(int16_t));

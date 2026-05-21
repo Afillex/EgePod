@@ -80,7 +80,11 @@ int cpu_apply_dap_policy(void)
 
         snprintf(path, sizeof(path),
                  "/sys/devices/system/cpu/%s/cpufreq/scaling_max_freq", a55_cores[i]);
-        if (sysfs_write(path, "1200000") != 0) errors++;   /* 1.2 GHz */
+        if (sysfs_write(path, "1200000") != 0) errors++;   /* 1.2 GHz ceiling */
+
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/%s/cpufreq/scaling_min_freq", a55_cores[i]);
+        if (sysfs_write(path, "400000")  != 0) errors++;   /* 400 MHz floor */
     }
 
     /* 3. GPU: disable clocking (Mali-G76) */
@@ -96,6 +100,16 @@ int cpu_apply_dap_policy(void)
     /* 6. Dirty-page flush: write-back less aggressively to lower eMMC wakeup */
     sysfs_write("/proc/sys/vm/dirty_writeback_centisecs", "6000");
     sysfs_write("/proc/sys/vm/dirty_expire_centisecs",    "12000");
+
+    /* 7. Transparent hugepages: disable to prevent background compaction wakeups */
+    sysfs_write("/sys/kernel/mm/transparent_hugepage/enabled", "never");
+    sysfs_write("/sys/kernel/mm/transparent_hugepage/defrag",  "never");
+
+    /* 8. eMMC I/O scheduler: no-op removes periodic elevator timer wakeups */
+    sysfs_write("/sys/block/mmcblk0/queue/scheduler", "none");
+
+    /* 9. Timer migration: keep timers on their origin CPU — fewer cross-CPU IPIs */
+    sysfs_write("/proc/sys/kernel/timer_migration", "0");
 
     if (errors > 0)
         LOGW("pwrd: %d sysfs writes failed (some paths may not exist on this kernel)",
@@ -119,6 +133,8 @@ void cpu_restore_defaults(void)
         sysfs_write(path, "schedutil");
     }
     sysfs_write("/sys/class/misc/mali0/device/power_policy", "demand");
+    sysfs_write("/sys/kernel/mm/transparent_hugepage/enabled", "madvise");
+    sysfs_write("/proc/sys/kernel/timer_migration", "1");
     LOGI("pwrd: default CPU policy restored");
 }
 

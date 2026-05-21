@@ -84,7 +84,7 @@ AlsaOut *alsa_out_open(unsigned int card, unsigned int device,
         .channels     = channels,
         .rate         = rate,
         .period_size  = 4096,
-        .period_count = 4,
+        .period_count = 8,   /* 8×4096 = ~742ms buffer; CPU sleeps longer between refills */
         .format       = PCM_FORMAT_S16_LE,
         /* start_threshold = 0 means hardware starts as soon as first period
          * is written, minimising initial latency. */

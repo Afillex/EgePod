@@ -389,8 +389,6 @@ int alsa_out_write(AlsaOut *out, const int16_t *frames, size_t frame_count)
 
         size_t n = fwrite(frames, sizeof(int16_t), frame_count * out->channels,
                           out->raw_file);
-        fflush(out->raw_file);
-
         /* Sleep until deadline — zero-cost if fwrite already took enough time. */
         int snret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &out->deadline, NULL);
 

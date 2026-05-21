@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
@@ -21,8 +22,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <time.h>
-#include <pthread.h>
 
 #ifndef MUSIC_DIR
 #define MUSIC_DIR    "/sdcard/Music"
@@ -54,23 +53,6 @@ static int create_server_socket(const char *path)
         close(fd); return -1;
     }
     return fd;
-}
-
-/* ── position ticker ───────────────────────────────────────────────────── */
-
-static int g_timer_write_fd = -1;
-
-static void *timer_thread(void *arg)
-{
-    (void)arg;
-    /* Fire at 5 Hz for a smooth progress bar. */
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = 200000000 }; /* 200 ms */
-    while (!g_quit) {
-        nanosleep(&ts, NULL);
-        uint8_t byte = 0;
-        (void)write(g_timer_write_fd, &byte, 1);
-    }
-    return NULL;
 }
 
 /* ── main ──────────────────────────────────────────────────────────────── */
@@ -105,19 +87,17 @@ int main(void)
     int srv_fd = create_server_socket(AUDIOD_SOCK_PATH);
     if (srv_fd < 0) { player_destroy(player); index_free(index); return 1; }
 
-    /* Timer pipe */
-    int pfd[2];
-    if (pipe2(pfd, O_NONBLOCK | O_CLOEXEC) < 0) {
-        LOGE("audiod: pipe: %s", strerror(errno));
+    /* Position ticker: timerfd at 5 Hz — no extra thread needed. */
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (tfd < 0) {
+        LOGE("audiod: timerfd: %s", strerror(errno));
         player_destroy(player); index_free(index); close(srv_fd); return 1;
     }
-    g_timer_write_fd = pfd[1];
-    pthread_t ttid;
-    if (pthread_create(&ttid, NULL, timer_thread, NULL) != 0) {
-        LOGE("audiod: timer thread: %s", strerror(errno));
-        close(pfd[0]); close(pfd[1]);
-        player_destroy(player); index_free(index); close(srv_fd); return 1;
-    }
+    struct itimerspec its = {
+        .it_value    = { .tv_sec = 0, .tv_nsec = 200000000 },
+        .it_interval = { .tv_sec = 0, .tv_nsec = 200000000 },
+    };
+    timerfd_settime(tfd, 0, &its, NULL);
 
     /* epoll */
     int ep = epoll_create1(EPOLL_CLOEXEC);
@@ -128,8 +108,8 @@ int main(void)
     epoll_ctl(ep, EPOLL_CTL_ADD, srv_fd, &ev);
 
     ev.events  = EPOLLIN;
-    ev.data.fd = pfd[0];
-    epoll_ctl(ep, EPOLL_CTL_ADD, pfd[0], &ev);
+    ev.data.fd = tfd;
+    epoll_ctl(ep, EPOLL_CTL_ADD, tfd, &ev);
 
     /* Track connected client fds */
     int clients[MAX_IPC_CLIENTS];
@@ -170,8 +150,8 @@ int main(void)
             }
 
             /* ── position tick ── */
-            if (fd == pfd[0]) {
-                uint8_t buf[64]; (void)read(pfd[0], buf, sizeof(buf)); /* drain */
+            if (fd == tfd) {
+                uint64_t exp; (void)read(tfd, &exp, sizeof(exp)); /* drain expirations */
                 uint32_t pos = player_get_position(player);
                 static uint32_t last_pos = UINT32_MAX;
                 if (pos == UINT32_MAX) {
@@ -219,9 +199,7 @@ drop_client:
     }
 
     LOGI("audiod: shutting down");
-    g_quit = 1;
-    pthread_join(ttid, NULL);
-    close(pfd[0]); close(pfd[1]);
+    close(tfd);
     close(srv_fd);
     for (int i = 0; i < n_clients; i++) if (clients[i] >= 0) close(clients[i]);
     close(ep);

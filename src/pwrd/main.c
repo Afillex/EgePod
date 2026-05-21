@@ -26,7 +26,7 @@
 #include <stdio.h>
 #include <stdint.h>
 
-#define BATTERY_INTERVAL_SEC    5
+#define BATTERY_INTERVAL_SEC    30  /* battery % changes ~1% per 6–10 min at 30mA */
 #define THERMAL_WARN_CELSIUS   45   /* notify UI above this */
 #define BRIGHTNESS_PATH        "/sys/class/leds/lcd-backlight/brightness"
 #define BRIGHTNESS_ON          "200"
