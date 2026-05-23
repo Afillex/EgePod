@@ -93,9 +93,20 @@ int main(void)
     LOG_OPEN("egepod_audiod");
     LOGI("audiod: starting");
 
-    signal(SIGTERM, on_signal);
-    signal(SIGINT,  on_signal);
-    signal(SIGPIPE, SIG_IGN);
+    /* sigaction without SA_RESTART: epoll_wait returns EINTR on SIGTERM so
+     * the event loop re-evaluates g_quit without needing a forced g_quit=1
+     * inside an IPC handler.  All other blocking calls here are timerfd reads
+     * which also handle EINTR explicitly. */
+    {
+        struct sigaction sa = {0};
+        sa.sa_handler = on_signal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;   /* no SA_RESTART */
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT,  &sa, NULL);
+        sa.sa_handler = SIG_IGN;
+        sigaction(SIGPIPE, &sa, NULL);
+    }
 
     /* Raise RLIMIT_MEMLOCK to unlimited so mlock() on large PCM buffers
      * succeeds.  Default limit (64 KB) is far below a 5-min FLAC (~31 MB).

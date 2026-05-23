@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <assert.h>
 #include "track.h"
 
 #ifdef SIMULATE
@@ -37,10 +38,14 @@ typedef enum {
     CMD_SCREEN_OFF  = 0x41,
     CMD_SCREEN_ON   = 0x42,
     CMD_SET_VOLUME  = 0x43,   /* param.volume (0–100) */
+    CMD_REBOOT      = 0x44,   /* pwrd broadcasts EVT_SHUTDOWN_PENDING then reboots */
+    CMD_SHUTDOWN    = 0x45,   /* pwrd broadcasts EVT_SHUTDOWN_PENDING then powers off */
 
     /* Events: pwrd → UI */
-    EVT_BATTERY     = 0xC1,   /* param.battery_pct */
-    EVT_THERMAL     = 0xC2,   /* param.temp_celsius (x10, e.g. 352 = 35.2°C) */
+    EVT_BATTERY          = 0xC1,   /* param.battery_pct */
+    EVT_THERMAL          = 0xC2,   /* param.temp_celsius (x10, e.g. 352 = 35.2°C) */
+    EVT_VOLUME           = 0xC3,   /* param.volume (0–100) — broadcast on volume change */
+    EVT_SHUTDOWN_PENDING = 0xC5,   /* ~500 ms before reboot/poweroff; save state, show splash */
 } IpcMsgType;
 
 typedef enum {
@@ -71,3 +76,13 @@ typedef struct __attribute__((packed)) {
         uint8_t     raw[sizeof(TrackInfo)];
     } param;
 } IpcMsg;
+
+/* Compile-time wire-format guard: if TrackInfo changes size or __packed__
+ * is removed, all daemons would silently misparse every message.  Fail the
+ * build immediately instead. */
+_Static_assert(sizeof(((IpcMsg *)0)->type)
+             + sizeof(((IpcMsg *)0)->_pad)
+             + sizeof(((IpcMsg *)0)->seq) == 8,
+               "IpcMsg header must be exactly 8 bytes (type[1]+pad[3]+seq[4])");
+_Static_assert(sizeof(PlayerState) == sizeof(uint32_t),
+               "PlayerState enum must be uint32-sized for IPC param union");

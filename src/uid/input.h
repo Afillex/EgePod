@@ -11,7 +11,7 @@ typedef enum {
     INPUT_POWER_BUTTON,      /* value=1 press, value=0 release */
     INPUT_VOLUME_UP,
     INPUT_VOLUME_DOWN,
-    INPUT_POWER_BUTTON_LONG, /* ≥750 ms hold — sim: Shift+P in viewer */
+    INPUT_POWER_BUTTON_LONG, /* ≥400 ms hold — sim: Shift+P in viewer */
 } InputEvent;
 
 typedef struct {

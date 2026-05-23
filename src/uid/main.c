@@ -47,7 +47,7 @@ int ipc_recv(int fd, IpcMsg *out);
 static _Atomic int    g_quit          = 0;
 static int            g_screen_on     = 1;
 static int            g_progress_tfd  = -1;  /* 20 Hz timerfd for progress bar redraws */
-static int            g_power_long_tfd = -1;  /* 750 ms timerfd for long-press detection */
+static int            g_power_long_tfd = -1;  /* 400 ms timerfd for long-press detection */
 static uint32_t       g_volume        = 70;   /* current volume 0-100 */
 static InputCtx      *g_input         = NULL; /* set after input_open() */
 
@@ -122,7 +122,7 @@ static void power_long_arm(void)
 {
     if (g_power_long_tfd < 0) return;
     struct itimerspec its = {
-        .it_value    = { .tv_nsec = 750000000 },   /* 750 ms one-shot */
+        .it_value    = { .tv_nsec = 400000000 },   /* 400 ms one-shot — snappier than Android 750 ms */
         .it_interval = { 0, 0 },
     };
     timerfd_settime(g_power_long_tfd, 0, &its, NULL);
@@ -175,9 +175,19 @@ int main(void)
     LOG_OPEN("egepod_uid");
     LOGI("uid: starting");
 
-    signal(SIGTERM, on_signal);
-    signal(SIGINT,  on_signal);
-    signal(SIGPIPE, SIG_IGN);
+    /* sigaction without SA_RESTART so epoll_wait returns EINTR on SIGTERM,
+     * allowing the event loop to re-check g_quit.  Any new blocking syscall
+     * added to this daemon must handle EINTR — see existing epoll_wait path. */
+    {
+        struct sigaction sa = {0};
+        sa.sa_handler = on_signal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;   /* no SA_RESTART */
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT,  &sa, NULL);
+        sa.sa_handler = SIG_IGN;
+        sigaction(SIGPIPE, &sa, NULL);
+    }
 
     if (fb_open(&g_fb) != 0) {
         LOGE("uid: cannot open framebuffer");
@@ -212,7 +222,7 @@ int main(void)
         epoll_ctl(ep, EPOLL_CTL_ADD, g_progress_tfd, &ev);
     }
 
-    /* 750 ms one-shot timerfd for power-button long-press detection */
+    /* 400 ms one-shot timerfd for power-button long-press detection */
     g_power_long_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (g_power_long_tfd >= 0) {
         ev.events = EPOLLIN; ev.data.fd = g_power_long_tfd;
@@ -399,7 +409,7 @@ int main(void)
             if (fd == g_power_long_tfd) {
                 uint64_t exp;
                 (void)read(g_power_long_tfd, &exp, sizeof(exp));
-                /* 750 ms expired — open power menu */
+                /* 400 ms expired — open power menu */
                 if (!g_screen_on) screen_on();
                 pthread_mutex_lock(&g_ui_lock);
                 g_ui.power_menu_open = 1;

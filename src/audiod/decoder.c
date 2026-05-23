@@ -43,6 +43,13 @@ static AudioFormat detect_format(const char *path)
     return FMT_UNKNOWN;
 }
 
+/* Hard cap on the compressed input buffer.  A 256 MB FLAC is roughly 3 hours
+ * of CD-quality lossless audio — any larger file is almost certainly a
+ * mis-indexed non-audio file, a truncated download, or a malformed header.
+ * Without this cap, a device-filling file triggers OOM-kill on audiod,
+ * which drops the mlock'd PCM and causes an audible dropout. */
+#define SLURP_MAX_BYTES (256UL * 1024UL * 1024UL)
+
 /* Read entire file into a heap buffer.  Returns buf + size. */
 static uint8_t *slurp_file(const char *path, size_t *size_out)
 {
@@ -51,6 +58,13 @@ static uint8_t *slurp_file(const char *path, size_t *size_out)
 
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return NULL; }
+
+    if ((size_t)st.st_size > SLURP_MAX_BYTES) {
+        LOGE("decoder: %s exceeds %zu MB input cap (%lld bytes) — refusing",
+             path, SLURP_MAX_BYTES >> 20, (long long)st.st_size);
+        close(fd);
+        return NULL;
+    }
 
     uint8_t *buf = malloc((size_t)st.st_size);
     if (!buf) { close(fd); return NULL; }

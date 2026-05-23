@@ -83,9 +83,16 @@ int main(void)
     LOG_OPEN("egepod_pwrd");
     LOGI("pwrd: starting");
 
-    signal(SIGTERM, on_signal);
-    signal(SIGINT,  on_signal);
-    signal(SIGPIPE, SIG_IGN);
+    {
+        struct sigaction sa = {0};
+        sa.sa_handler = on_signal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;   /* no SA_RESTART — epoll_wait must return EINTR on SIGTERM */
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT,  &sa, NULL);
+        sa.sa_handler = SIG_IGN;
+        sigaction(SIGPIPE, &sa, NULL);
+    }
 
     /* Apply power policy — must be done before audiod starts */
     cpu_apply_dap_policy();
