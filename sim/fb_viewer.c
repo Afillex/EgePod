@@ -32,6 +32,12 @@
 #define SCALE        0.55f   /* window = 396 × 704 */
 #define TARGET_FPS   60
 
+/* Mirror of InputEvent enum from src/uid/input.h — kept in sync manually */
+#define SIM_INPUT_POWER_BUTTON       6
+#define SIM_INPUT_VOLUME_UP          7
+#define SIM_INPUT_VOLUME_DOWN        8
+#define SIM_INPUT_POWER_BUTTON_LONG  9
+
 /* Read page index and generation counter from the sidecar file.
  * Returns 1 if successfully parsed both fields, 0 otherwise. */
 static int read_page_info(const char *page_file, int *page_out, uint32_t *gen_out)
@@ -47,10 +53,28 @@ static int read_page_info(const char *page_file, int *page_out, uint32_t *gen_ou
     return 1;
 }
 
+/* Single seq counter shared by write_tap and write_key_event.
+ * uid's sim_last_seq comparison requires every event (tap or key) to have
+ * a unique, monotonically-increasing number; independent per-function
+ * counters would cause the first tap after a key event to be silently dropped
+ * (both start at 0 and reach the same value on their first increment). */
+static uint32_t s_seq = 0;
+
 static void write_tap(const char *tap_path, int fb_x, int fb_y)
 {
-    static uint32_t seq = 0;
-    struct { int32_t x, y; uint32_t seq; } ev = { fb_x, fb_y, ++seq };
+    struct { int32_t x, y; uint32_t seq; } ev = { fb_x, fb_y, ++s_seq };
+    int fd = open(tap_path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    ftruncate(fd, sizeof(ev));
+    pwrite(fd, &ev, sizeof(ev), 0);
+    close(fd);
+}
+
+/* Synthetic key event: x=-1, y=InputEvent enum value.
+ * input.c in SIMULATE mode checks for x<0 and routes accordingly. */
+static void write_key_event(const char *tap_path, int input_event_type)
+{
+    struct { int32_t x, y; uint32_t seq; } ev = { -1, input_event_type, ++s_seq };
     int fd = open(tap_path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) return;
     ftruncate(fd, sizeof(ev));
@@ -61,9 +85,10 @@ static void write_tap(const char *tap_path, int fb_x, int fb_y)
 int main(int argc, char **argv)
 {
     const char *fb_path = (argc > 1) ? argv[1] : "/tmp/egepod_fb.raw";
-    char page_path[512], tap_path[512];
-    snprintf(page_path, sizeof(page_path), "%s.page", fb_path);
-    snprintf(tap_path,  sizeof(tap_path),  "%s.tap",  fb_path);
+    char page_path[512], tap_path[512], shut_path[512];
+    snprintf(page_path, sizeof(page_path), "%s.page",     fb_path);
+    snprintf(tap_path,  sizeof(tap_path),  "%s.tap",      fb_path);
+    snprintf(shut_path, sizeof(shut_path), "%s.shutdown", fb_path);
 
     size_t page_bytes = (size_t)FB_W * FB_H * 4;
     size_t total      = page_bytes * 2;
@@ -105,8 +130,9 @@ int main(int argc, char **argv)
         SDL_TEXTUREACCESS_STREAMING,
         FB_W, FB_H);
 
-    SDL_SetWindowTitle(win, "EgePod  (Q = quit, click = tap)");
-    printf("fb_viewer: window %dx%d (%.0f%% scale). Q = quit, click = tap.\n",
+    SDL_SetWindowTitle(win, "EgePod  (Q=quit  P=power  Shift+P=menu  ↑↓=volume  click=tap)");
+    printf("fb_viewer: window %dx%d (%.0f%% scale).\n"
+           "  Keys: Q/Esc=quit  P=power  Shift+P=power-menu  Up/Down=volume  click=tap\n",
            win_w, win_h, SCALE * 100.0f);
 
     uint32_t ms_per_frame = 1000 / TARGET_FPS;
@@ -120,9 +146,28 @@ int main(int argc, char **argv)
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = 0;
-            if (e.type == SDL_KEYDOWN &&
-               (e.key.keysym.sym == SDLK_q || e.key.keysym.sym == SDLK_ESCAPE))
-                running = 0;
+
+            if (e.type == SDL_KEYDOWN) {
+                SDL_Keycode sym = e.key.keysym.sym;
+                int shift = (e.key.keysym.mod & KMOD_SHIFT) != 0;
+                if (sym == SDLK_q || sym == SDLK_ESCAPE) {
+                    running = 0;
+                } else if (sym == SDLK_p && shift) {
+                    /* Shift+P → power long-press (open power menu) */
+                    write_key_event(tap_path, SIM_INPUT_POWER_BUTTON_LONG);
+                    printf("fb_viewer: synthetic power long-press\n");
+                } else if (sym == SDLK_p) {
+                    /* P → power short-press (screen on/off) */
+                    write_key_event(tap_path, SIM_INPUT_POWER_BUTTON);
+                    printf("fb_viewer: synthetic power press\n");
+                } else if (sym == SDLK_UP) {
+                    write_key_event(tap_path, SIM_INPUT_VOLUME_UP);
+                    printf("fb_viewer: synthetic volume up\n");
+                } else if (sym == SDLK_DOWN) {
+                    write_key_event(tap_path, SIM_INPUT_VOLUME_DOWN);
+                    printf("fb_viewer: synthetic volume down\n");
+                }
+            }
 
             if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
                 int fb_x = (int)(e.button.x / SCALE);
@@ -133,6 +178,15 @@ int main(int argc, char **argv)
                 if (fb_y >= FB_H) fb_y = FB_H - 1;
                 write_tap(tap_path, fb_x, fb_y);
                 printf("fb_viewer: tap at FB (%d, %d)\n", fb_x, fb_y);
+            }
+        }
+
+        /* uid writes this file when shutting down — close the viewer cleanly */
+        {
+            struct stat _ss;
+            if (stat(shut_path, &_ss) == 0) {
+                printf("fb_viewer: EgePod powered off — closing viewer\n");
+                running = 0;
             }
         }
 

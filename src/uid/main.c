@@ -146,8 +146,10 @@ static void screen_off(void)
     pthread_mutex_unlock(&g_ui_lock);
     /* Stop 20 Hz redraw wakeups so the SoC can stay in deep sleep. */
     progress_timer_disarm();
-    /* Stop sim tap polling — no taps are valid with screen off. */
-    input_set_polling(g_input, 0);
+    /* Commit lock state to the FB so the viewer reflects the new state.
+     * On hardware the backlight is off so this frame is invisible; in sim
+     * it prevents the stale power-menu frame from staying on screen. */
+    request_redraw();
     /* render thread stays blocked at sem_wait — no SIGSTOP needed */
     LOGI("uid: screen off (locked)");
 }
@@ -162,8 +164,6 @@ static void screen_on(void)
     PlayerState s = g_ui.state;
     pthread_mutex_unlock(&g_ui_lock);
     if (s == PLAYER_PLAYING) progress_timer_arm();
-    /* Resume sim tap polling now that the screen is active again. */
-    input_set_polling(g_input, 1);
     request_redraw();
     LOGI("uid: screen on");
 }
