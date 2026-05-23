@@ -134,6 +134,28 @@ InputCtx *input_open(int epoll_fd)
     return ctx;
 }
 
+void input_set_polling(InputCtx *ctx, int on)
+{
+#ifdef SIMULATE
+    if (!ctx || ctx->sim_tap_tfd < 0) return;
+    struct itimerspec ts;
+    if (on) {
+        ts.it_interval.tv_sec  = 0;
+        ts.it_interval.tv_nsec = 16666667;   /* ~60 Hz */
+        ts.it_value.tv_sec     = 0;
+        ts.it_value.tv_nsec    = 16666667;
+    } else {
+        ts.it_interval.tv_sec  = 0;
+        ts.it_interval.tv_nsec = 0;
+        ts.it_value.tv_sec     = 0;
+        ts.it_value.tv_nsec    = 0;
+    }
+    timerfd_settime(ctx->sim_tap_tfd, 0, &ts, NULL);
+#else
+    (void)ctx; (void)on;
+#endif
+}
+
 void input_close(InputCtx *ctx)
 {
     if (!ctx) return;
@@ -164,9 +186,15 @@ InputEvt input_process_fd(InputCtx *ctx, int ready_fd)
             if (pread(tapfd, &ev, sizeof(ev), 0) == (ssize_t)sizeof(ev) &&
                 ev.seq != ctx->sim_last_seq) {
                 ctx->sim_last_seq = ev.seq;
-                result.type = INPUT_TAP;
-                result.x    = ev.x;
-                result.y    = ev.y;
+                if (ev.x < 0) {
+                    /* x=-1: synthetic key event; y encodes the InputEvent type */
+                    result.type  = (InputEvent)ev.y;
+                    result.value = 1;
+                } else {
+                    result.type = INPUT_TAP;
+                    result.x    = ev.x;
+                    result.y    = ev.y;
+                }
             }
             close(tapfd);
         }
@@ -187,13 +215,21 @@ InputEvt input_process_fd(InputCtx *ctx, int ready_fd)
     while ((rd = read(ready_fd, ev, sizeof(ev))) > 0) {
         int n = (int)(rd / sizeof(struct input_event));
         for (int i = 0; i < n; i++) {
-            /* KEY events */
-            if (ev[i].type == EV_KEY && ev[i].value == 1 /* pressed */) {
-                switch (ev[i].code) {
-                case KEY_POWER:      result.type = INPUT_POWER_BUTTON; break;
-                case KEY_VOLUMEUP:   result.type = INPUT_VOLUME_UP;    break;
-                case KEY_VOLUMEDOWN: result.type = INPUT_VOLUME_DOWN;  break;
-                default: break;
+            /* KEY events — power button fires on both press (1) and release (0) */
+            if (ev[i].type == EV_KEY) {
+                if (ev[i].value == 1 /* pressed */) {
+                    switch (ev[i].code) {
+                    case KEY_POWER:
+                        result.type  = INPUT_POWER_BUTTON;
+                        result.value = 1;
+                        break;
+                    case KEY_VOLUMEUP:   result.type = INPUT_VOLUME_UP;    break;
+                    case KEY_VOLUMEDOWN: result.type = INPUT_VOLUME_DOWN;  break;
+                    default: break;
+                    }
+                } else if (ev[i].value == 0 /* released */ && ev[i].code == KEY_POWER) {
+                    result.type  = INPUT_POWER_BUTTON;
+                    result.value = 0;
                 }
             }
             /* Multi-touch */

@@ -8,6 +8,8 @@
 
 #include "player.h"
 #include "index.h"
+#include "persist.h"
+#include "h2w.h"
 #include "../common/ipc.h"
 #include "../common/log.h"
 
@@ -30,8 +32,35 @@
 #define MAX_EVENTS   (MAX_IPC_CLIENTS + 2)
 
 static volatile int g_quit = 0;
+static int          g_tfd  = -1;   /* position timerfd — armed only while PLAYING */
 
 static void on_signal(int sig) { (void)sig; g_quit = 1; }
+
+static void tfd_arm(void)
+{
+    if (g_tfd < 0) return;
+    struct itimerspec its = {
+        .it_value    = { .tv_nsec = 200000000 },
+        .it_interval = { .tv_nsec = 200000000 },
+    };
+    timerfd_settime(g_tfd, 0, &its, NULL);
+}
+
+static void tfd_disarm(void)
+{
+    if (g_tfd < 0) return;
+    struct itimerspec its = { {0,0}, {0,0} };
+    timerfd_settime(g_tfd, 0, &its, NULL);
+}
+
+/* Called by player on every state transition (from playback thread or main).
+ * Fires timerfd only when audio is actually moving. */
+static void on_player_state(PlayerState s, void *ud)
+{
+    (void)ud;
+    if (s == PLAYER_PLAYING) tfd_arm();
+    else                     tfd_disarm();
+}
 
 /* ── IPC server setup ──────────────────────────────────────────────────── */
 
@@ -83,6 +112,30 @@ int main(void)
     Player *player = player_create(index);
     if (!player) { LOGE("audiod: player_create failed"); return 1; }
 
+    /* Resume from persisted state — loads track at saved position, paused.
+     * Never auto-plays: a DAP must not blast audio on unintended power-on. */
+    {
+        uint32_t saved_track = 0, saved_pos = 0;
+        int saved_playing = 0;
+        if (persist_load(&saved_track, &saved_pos, &saved_playing) == 0 &&
+            saved_track < (uint32_t)index_track_count(index)) {
+            IpcMsg cmd = {0};
+            cmd.type = CMD_LOAD_TRACK;
+            cmd.param.track_idx = saved_track;
+            player_handle_cmd(player, &cmd);
+            if (saved_pos > 0) {
+                cmd.type = CMD_SEEK;
+                cmd.param.seek_ms = saved_pos;
+                player_handle_cmd(player, &cmd);
+            }
+            cmd.type = CMD_PAUSE;
+            player_handle_cmd(player, &cmd);
+            LOGI("audiod: restored track=%u pos=%ums (paused)", saved_track, saved_pos);
+        }
+    }
+
+    H2wWatcher *h2w = h2w_start(player);
+
     /* Notify init that the service is ready.
      * On Android production EGEPOD_READY_DIR=/dev (writeable by root).
      * On simulation it stays /tmp (default). */
@@ -102,17 +155,15 @@ int main(void)
     int srv_fd = create_server_socket(AUDIOD_SOCK_PATH);
     if (srv_fd < 0) { player_destroy(player); index_free(index); return 1; }
 
-    /* Position ticker: timerfd at 5 Hz — no extra thread needed. */
-    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    /* Position ticker: timerfd at 5 Hz — armed only while PLAYING.
+     * Starts disarmed; the player state callback arms it on the first PLAY. */
+    g_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    int tfd = g_tfd;
     if (tfd < 0) {
         LOGE("audiod: timerfd: %s", strerror(errno));
         player_destroy(player); index_free(index); close(srv_fd); return 1;
     }
-    struct itimerspec its = {
-        .it_value    = { .tv_sec = 0, .tv_nsec = 200000000 },
-        .it_interval = { .tv_sec = 0, .tv_nsec = 200000000 },
-    };
-    timerfd_settime(tfd, 0, &its, NULL);
+    player_set_state_callback(player, on_player_state, NULL);
 
     /* epoll */
     int ep = epoll_create1(EPOLL_CLOEXEC);
@@ -158,7 +209,14 @@ int main(void)
                 ev.data.fd = cfd;
                 epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &ev);
 
-                /* Send index-ready immediately */
+                /* Push current player state BEFORE index-ready so uid knows
+                 * whether to auto-play (IDLE) or respect a persist-restored
+                 * PAUSED state without issuing CMD_PLAY on connect. */
+                {
+                    IpcMsg st_msg = { .type = EVT_STATE };
+                    st_msg.param.player_state = player_get_state(player);
+                    send(cfd, &st_msg, sizeof(st_msg), MSG_DONTWAIT);
+                }
                 send(cfd, &idx_ready, sizeof(idx_ready), MSG_DONTWAIT);
                 LOGI("audiod: client connected (fd=%d)", cfd);
                 continue;
@@ -167,6 +225,22 @@ int main(void)
             /* ── position tick ── */
             if (fd == tfd) {
                 uint64_t exp; (void)read(tfd, &exp, sizeof(exp)); /* drain expirations */
+
+                /* 5-second persist heartbeat: every 25 × 200ms ticks.
+                 * Skip when not PLAYING — paused state is identical to the last
+                 * persist, so the eMMC write is pure waste. */
+                static int persist_tick = 0;
+                if (++persist_tick >= 25) {
+                    persist_tick = 0;
+                    PlayerState pst = player_get_state(player);
+                    if (pst == PLAYER_PLAYING) {
+                        uint32_t ppos = player_get_position(player);
+                        if (ppos != UINT32_MAX)
+                            persist_save((uint32_t)player_get_track_idx(player),
+                                         ppos, 1);
+                    }
+                }
+
                 if (n_clients == 0) continue;   /* no subscribers — skip lock + send */
                 uint32_t pos = player_get_position(player);
                 static uint32_t last_pos = UINT32_MAX;
@@ -190,9 +264,27 @@ int main(void)
                 IpcMsg cmd;
                 ssize_t r = recv(fd, &cmd, sizeof(cmd), 0);
                 if (r == sizeof(cmd)) {
-                    IpcMsg reply = player_handle_cmd(player, &cmd);
-                    if (reply.type)
-                        send(fd, &reply, sizeof(reply), MSG_DONTWAIT);
+                    /* pwrd pushes EVT_SHUTDOWN_PENDING directly to our server socket
+                     * at reboot/shutdown time.  Intercept before player_handle_cmd
+                     * so we can persist state and exit cleanly. */
+                    if ((IpcMsgType)cmd.type == EVT_SHUTDOWN_PENDING) {
+                        LOGI("audiod: EVT_SHUTDOWN_PENDING — persisting state");
+                        uint32_t ppos = player_get_position(player);
+                        if (ppos != UINT32_MAX)
+                            persist_save((uint32_t)player_get_track_idx(player), ppos,
+                                         player_get_state(player) == PLAYER_PLAYING ? 1 : 0);
+                        g_quit = 1;
+                    } else {
+                        IpcMsg reply = player_handle_cmd(player, &cmd);
+                        if (reply.type)
+                            send(fd, &reply, sizeof(reply), MSG_DONTWAIT);
+                        /* CMD_PLAY doesn't call publish_state, so arm/disarm the
+                         * ticker here for the commands that go through this path. */
+                        if ((IpcMsgType)reply.type == EVT_STATE) {
+                            if (reply.param.player_state == PLAYER_PLAYING) tfd_arm();
+                            else                                             tfd_disarm();
+                        }
+                    }
                 } else if (r <= 0) {
                     goto drop_client;
                 }
@@ -215,6 +307,18 @@ drop_client:
     }
 
     LOGI("audiod: shutting down");
+
+    /* Save final position so resume-on-boot has the latest state. */
+    {
+        uint32_t fpos = player_get_position(player);
+        if (fpos != UINT32_MAX) {
+            PlayerState fst = player_get_state(player);
+            persist_save((uint32_t)player_get_track_idx(player), fpos,
+                         fst == PLAYER_PLAYING ? 1 : 0);
+        }
+    }
+
+    h2w_stop(h2w);
     close(tfd);
     close(srv_fd);
     for (int i = 0; i < n_clients; i++) if (clients[i] >= 0) close(clients[i]);

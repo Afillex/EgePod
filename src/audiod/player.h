@@ -14,9 +14,16 @@ void    player_destroy(Player *p);
  * type 0 if no reply is needed. */
 IpcMsg  player_handle_cmd(Player *p, const IpcMsg *cmd);
 
+/* Optional state-change callback for audiod main (timerfd arm/disarm).
+ * Must be called before the epoll event loop starts. */
+void player_set_state_callback(Player *p,
+                                void (*cb)(PlayerState s, void *ud), void *ud);
+
 /* Must be called periodically (~1 Hz) to push EVT_POSITION to subscribers.
- * Returns position_ms, or UINT32_MAX if not playing. */
-uint32_t player_get_position(Player *p);
+ * Returns position_ms, or UINT32_MAX if not playing/paused. */
+uint32_t    player_get_position(Player *p);
+size_t      player_get_track_idx(Player *p);
+PlayerState player_get_state(Player *p);
 
 /* Subscribe a client fd to receive unsolicited events (track change, position).
  * Returns 0 on success. */

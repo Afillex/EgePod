@@ -74,6 +74,11 @@ struct Player {
     int        subscribers[MAX_IPC_CLIENTS];
     int        sub_count;
 
+    /* Optional callback — fired (without p->lock held) on every PlayerState
+     * transition.  Wired to timerfd arm/disarm in audiod main.  NULL = off. */
+    void (*state_cb)(PlayerState s, void *ud);
+    void *state_cb_ud;
+
     /* Set to 1 to request all threads exit. */
     volatile int quit;
 };
@@ -126,6 +131,10 @@ static void publish_state(Player *p, PlayerState s)
     IpcMsg m = { .type = EVT_STATE, .seq = 0 };
     m.param.player_state = s;
     publish_event(p, &m);
+    /* Fire callback outside the hot-path subscriber loop.  The callback
+     * (timerfd arm/disarm) must not re-enter Player — it only calls
+     * timerfd_settime(), which is async-signal-safe. */
+    if (p->state_cb) p->state_cb(s, p->state_cb_ud);
 }
 
 static void publish_track(Player *p)
@@ -426,6 +435,14 @@ static void *playback_thread(void *arg)
 
 /* ── public API ────────────────────────────────────────────────────────── */
 
+/* Must be called before the event loop starts (not thread-safe vs publish_state). */
+void player_set_state_callback(Player *p,
+                                void (*cb)(PlayerState s, void *ud), void *ud)
+{
+    p->state_cb    = cb;
+    p->state_cb_ud = ud;
+}
+
 Player *player_create(IndexNode *index_root)
 {
     Player *p = calloc(1, sizeof(*p));
@@ -667,4 +684,20 @@ void player_unsubscribe(Player *p, int fd)
         }
     }
     pthread_mutex_unlock(&p->lock);
+}
+
+size_t player_get_track_idx(Player *p)
+{
+    pthread_mutex_lock(&p->lock);
+    size_t idx = p->cur_track;
+    pthread_mutex_unlock(&p->lock);
+    return idx;
+}
+
+PlayerState player_get_state(Player *p)
+{
+    pthread_mutex_lock(&p->lock);
+    PlayerState s = p->state;
+    pthread_mutex_unlock(&p->lock);
+    return s;
 }

@@ -47,6 +47,9 @@ int ipc_recv(int fd, IpcMsg *out);
 static volatile int   g_quit          = 0;
 static int            g_screen_on     = 1;
 static int            g_progress_tfd  = -1;  /* 20 Hz timerfd for progress bar redraws */
+static int            g_power_long_tfd = -1;  /* 750 ms timerfd for long-press detection */
+static uint32_t       g_volume        = 70;   /* current volume 0-100 */
+static InputCtx      *g_input         = NULL; /* set after input_open() */
 
 static int64_t mono_ms(void)
 {
@@ -115,15 +118,38 @@ static void request_redraw(void)
         sem_post(&g_render_sem);
 }
 
+static void power_long_arm(void)
+{
+    if (g_power_long_tfd < 0) return;
+    struct itimerspec its = {
+        .it_value    = { .tv_nsec = 750000000 },   /* 750 ms one-shot */
+        .it_interval = { 0, 0 },
+    };
+    timerfd_settime(g_power_long_tfd, 0, &its, NULL);
+}
+
+static void power_long_disarm(void)
+{
+    if (g_power_long_tfd < 0) return;
+    struct itimerspec its = { {0,0}, {0,0} };
+    timerfd_settime(g_power_long_tfd, 0, &its, NULL);
+}
+
 static void screen_off(void)
 {
     if (!g_screen_on) return;
     g_screen_on = 0;
     fb_set_brightness(0);
+    pthread_mutex_lock(&g_ui_lock);
+    g_ui.locked = 1;            /* turning screen off always locks */
+    g_ui.power_menu_open = 0;   /* dismiss menu if it was open */
+    pthread_mutex_unlock(&g_ui_lock);
     /* Stop 20 Hz redraw wakeups so the SoC can stay in deep sleep. */
     progress_timer_disarm();
+    /* Stop sim tap polling — no taps are valid with screen off. */
+    input_set_polling(g_input, 0);
     /* render thread stays blocked at sem_wait — no SIGSTOP needed */
-    LOGI("uid: screen off");
+    LOGI("uid: screen off (locked)");
 }
 
 static void screen_on(void)
@@ -136,6 +162,8 @@ static void screen_on(void)
     PlayerState s = g_ui.state;
     pthread_mutex_unlock(&g_ui_lock);
     if (s == PLAYER_PLAYING) progress_timer_arm();
+    /* Resume sim tap polling now that the screen is active again. */
+    input_set_polling(g_input, 1);
     request_redraw();
     LOGI("uid: screen on");
 }
@@ -184,7 +212,15 @@ int main(void)
         epoll_ctl(ep, EPOLL_CTL_ADD, g_progress_tfd, &ev);
     }
 
+    /* 750 ms one-shot timerfd for power-button long-press detection */
+    g_power_long_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (g_power_long_tfd >= 0) {
+        ev.events = EPOLLIN; ev.data.fd = g_power_long_tfd;
+        epoll_ctl(ep, EPOLL_CTL_ADD, g_power_long_tfd, &ev);
+    }
+
     InputCtx *input = input_open(ep);
+    g_input = input;
 
     /* Initial draw */
     g_ui.battery_pct = 100;
@@ -229,12 +265,8 @@ int main(void)
                         g_ui.track_count    = msg.param.track_count;
                         g_ui.library_loaded = 0;
                         g_lib_fetch_idx     = 0;
-                        /* Auto-play first track on startup */
-                        if (audiod_fd >= 0 && g_ui.state == PLAYER_IDLE) {
-                            ipc_send_cmd(audiod_fd, CMD_LOAD_TRACK, 0);
-                            ipc_send_cmd(audiod_fd, CMD_PLAY, 0);
-                        }
-                        /* Kick off background library metadata fetch */
+                        /* Kick off background library metadata fetch — no auto-play.
+                         * A DAP must never blast audio on unintended power-on. */
                         if (msg.param.track_count > 0 && audiod_fd >= 0)
                             ipc_send_cmd(audiod_fd, CMD_GET_TRACK_INFO, 0);
                         break;
@@ -279,7 +311,11 @@ int main(void)
                              * before the pause. audiod's next EVT_POSITION
                              * (≤200 ms away) refines this. */
                             g_ui.pos_ref_mono_ms = mono_ms();
-                            progress_timer_arm();
+                            /* Only arm the progress timer if the screen is on —
+                             * with the screen off there's nothing to redraw and
+                             * the 20 Hz wakeup wastes CPU. screen_on() re-arms
+                             * when the user wakes the device. */
+                            if (g_screen_on) progress_timer_arm();
                         } else {
                             progress_timer_disarm();
                         }
@@ -306,8 +342,45 @@ int main(void)
                 IpcMsg msg;
                 if (ipc_recv(pwrd_fd, &msg) == 0) {
                     pthread_mutex_lock(&g_ui_lock);
-                    if (msg.type == EVT_BATTERY)
+                    switch ((IpcMsgType)msg.type) {
+                    case EVT_BATTERY:
                         g_ui.battery_pct = msg.param.battery_pct;
+                        break;
+                    case EVT_VOLUME:
+                        g_volume = msg.param.volume;
+                        g_ui.volume = msg.param.volume;
+                        break;
+                    case EVT_SHUTDOWN_PENDING:
+                        g_ui.shutting_down = 1;
+                        /* Force a redraw regardless of screen state so the
+                         * splash is committed to the FB before pwrd kills us. */
+                        pthread_mutex_unlock(&g_ui_lock);
+                        request_redraw();
+#ifdef SIMULATE
+                        /* Give the render thread ~150 ms to commit the splash,
+                         * then signal the macOS fb_viewer to close. */
+                        {
+                            struct timespec _ts = { .tv_nsec = 150000000L };
+                            nanosleep(&_ts, NULL);
+                            const char *_fb = getenv("EGEPOD_FB_FILE");
+                            if (_fb && _fb[0]) {
+                                char _shut[520];
+                                snprintf(_shut, sizeof(_shut), "%s.shutdown", _fb);
+                                FILE *_f = fopen(_shut, "w");
+                                if (_f) { fputs("1\n", _f); fclose(_f); }
+                            }
+                        }
+#endif
+                        /* Exit the event loop — on real hardware init/pwrd will
+                         * SIGKILL us, but self-terminating is cleaner (runs
+                         * cleanup) and fixes the sim path where SA_RESTART on
+                         * signal() causes epoll_wait to restart after SIGTERM
+                         * rather than returning EINTR. */
+                        g_quit = 1;
+                        pthread_mutex_lock(&g_ui_lock);
+                        break;
+                    default: break;
+                    }
                     pthread_mutex_unlock(&g_ui_lock);
                     if (g_screen_on) request_redraw();
                 }
@@ -322,13 +395,53 @@ int main(void)
                 continue;
             }
 
+            /* ── power long-press timer ── */
+            if (fd == g_power_long_tfd) {
+                uint64_t exp;
+                (void)read(g_power_long_tfd, &exp, sizeof(exp));
+                /* 750 ms expired — open power menu */
+                if (!g_screen_on) screen_on();
+                pthread_mutex_lock(&g_ui_lock);
+                g_ui.power_menu_open = 1;
+                pthread_mutex_unlock(&g_ui_lock);
+                request_redraw();
+                LOGI("uid: power long-press → power menu");
+                continue;
+            }
+
             /* ── input events ── */
             if (input) {
                 InputEvt ie = input_process_fd(input, fd);
+                /* Ignore all input while shutting down */
+                pthread_mutex_lock(&g_ui_lock);
+                int shutting = g_ui.shutting_down;
+                pthread_mutex_unlock(&g_ui_lock);
+                if (shutting) break;   /* drop all input events */
+
                 switch (ie.type) {
                 case INPUT_POWER_BUTTON:
-                    if (g_screen_on) screen_off();
-                    else             screen_on();
+                    if (ie.value == 1) {
+                        /* Key down — arm 750 ms long-press timer */
+                        power_long_arm();
+                    } else {
+                        /* Key up — if timer didn't fire yet → short press */
+                        power_long_disarm();
+                        pthread_mutex_lock(&g_ui_lock);
+                        int menu_open = g_ui.power_menu_open;
+                        pthread_mutex_unlock(&g_ui_lock);
+                        if (!menu_open) {
+                            if (g_screen_on) screen_off();
+                            else             screen_on();
+                        }
+                    }
+                    break;
+                case INPUT_POWER_BUTTON_LONG:
+                    /* Synthetic event from fb_viewer (Shift+P shortcut) */
+                    if (!g_screen_on) screen_on();
+                    pthread_mutex_lock(&g_ui_lock);
+                    g_ui.power_menu_open = 1;
+                    pthread_mutex_unlock(&g_ui_lock);
+                    request_redraw();
                     break;
                 case INPUT_TAP: {
                     /* Scale from physical device pixels to 720×1280 design space */
@@ -339,6 +452,46 @@ int main(void)
                                 ? (int)((int64_t)ie.y * UI_DESIGN_H / (int)g_fb.height)
                                 : ie.y;
                     if (!g_screen_on) { screen_on(); break; }
+
+                    /* Power menu takes priority over all other tap routing */
+                    pthread_mutex_lock(&g_ui_lock);
+                    int pmenu = g_ui.power_menu_open;
+                    int locked = g_ui.locked;
+                    pthread_mutex_unlock(&g_ui_lock);
+
+                    if (pmenu) {
+                        /* Tap inside a button */
+                        if (tap_x >= UI_PMENU_BTN_X &&
+                            tap_x <  UI_PMENU_BTN_X + UI_PMENU_BTN_W) {
+                            if (tap_y >= UI_PMENU_BTN_LOCK_Y &&
+                                tap_y <  UI_PMENU_BTN_LOCK_Y + UI_PMENU_BTN_H) {
+                                screen_off();   /* sets locked=1, power_menu_open=0 */
+                            } else if (tap_y >= UI_PMENU_BTN_REBT_Y &&
+                                       tap_y <  UI_PMENU_BTN_REBT_Y + UI_PMENU_BTN_H) {
+                                ipc_send_cmd(pwrd_fd, CMD_REBOOT, 0);
+                            } else if (tap_y >= UI_PMENU_BTN_SHDN_Y &&
+                                       tap_y <  UI_PMENU_BTN_SHDN_Y + UI_PMENU_BTN_H) {
+                                ipc_send_cmd(pwrd_fd, CMD_SHUTDOWN, 0);
+                            } else {
+                                /* tap inside card but not a button — dismiss */
+                                pthread_mutex_lock(&g_ui_lock);
+                                g_ui.power_menu_open = 0;
+                                pthread_mutex_unlock(&g_ui_lock);
+                                request_redraw();
+                            }
+                        } else {
+                            /* tap outside card — dismiss */
+                            pthread_mutex_lock(&g_ui_lock);
+                            g_ui.power_menu_open = 0;
+                            pthread_mutex_unlock(&g_ui_lock);
+                            request_redraw();
+                        }
+                        break;
+                    }
+
+                    /* Lock screen: taps are ignored (only swipe-up unlocks) */
+                    if (locked) break;
+
                     if (g_ui.lib_mode) {
                         /* Library view: y < back threshold → exit; else select row */
                         if (tap_y < UI_LIB_BACK_H) {
@@ -404,15 +557,27 @@ int main(void)
                     break;
                 }
                 case INPUT_SWIPE_LEFT:
-                    if (g_screen_on && !g_ui.lib_mode)
+                    if (g_screen_on && !g_ui.lib_mode && !g_ui.locked)
                         ipc_send_cmd(audiod_fd, CMD_NEXT, 0);
                     break;
                 case INPUT_SWIPE_RIGHT:
-                    if (g_screen_on && !g_ui.lib_mode)
+                    if (g_screen_on && !g_ui.lib_mode && !g_ui.locked)
                         ipc_send_cmd(audiod_fd, CMD_PREV, 0);
                     break;
                 case INPUT_SWIPE_UP:
                     if (g_screen_on) {
+                        pthread_mutex_lock(&g_ui_lock);
+                        int is_locked = g_ui.locked;
+                        pthread_mutex_unlock(&g_ui_lock);
+                        if (is_locked) {
+                            /* Swipe up unlocks */
+                            pthread_mutex_lock(&g_ui_lock);
+                            g_ui.locked = 0;
+                            pthread_mutex_unlock(&g_ui_lock);
+                            request_redraw();
+                            LOGI("uid: unlocked");
+                            break;
+                        }
                         if (g_ui.lib_mode) {
                             pthread_mutex_lock(&g_ui_lock);
                             int max_s = (int)g_ui.track_count - UI_LIB_VISIBLE;
@@ -453,10 +618,16 @@ int main(void)
                     }
                     break;
                 case INPUT_VOLUME_UP:
-                    ipc_send_cmd(pwrd_fd, CMD_SET_VOLUME, 0);   /* handled by pwrd */
+                    if (g_volume < 100) {
+                        g_volume += 10;
+                        if (g_volume > 100) g_volume = 100;
+                    }
+                    ipc_send_cmd(pwrd_fd, CMD_SET_VOLUME, g_volume);
                     break;
                 case INPUT_VOLUME_DOWN:
-                    ipc_send_cmd(pwrd_fd, CMD_SET_VOLUME, 0);
+                    if (g_volume >= 10) g_volume -= 10;
+                    else g_volume = 0;
+                    ipc_send_cmd(pwrd_fd, CMD_SET_VOLUME, g_volume);
                     break;
                 default: break;
                 }
@@ -468,10 +639,11 @@ int main(void)
     g_quit = 1;
     sem_post(&g_render_sem);   /* unblock render thread so it can exit */
     pthread_join(g_render_tid, NULL);
-    if (input)            input_close(input);
-    if (audiod_fd >= 0)   close(audiod_fd);
-    if (pwrd_fd   >= 0)   close(pwrd_fd);
-    if (g_progress_tfd >= 0) close(g_progress_tfd);
+    if (input)               input_close(input);
+    if (audiod_fd >= 0)      close(audiod_fd);
+    if (pwrd_fd   >= 0)      close(pwrd_fd);
+    if (g_progress_tfd  >= 0) close(g_progress_tfd);
+    if (g_power_long_tfd >= 0) close(g_power_long_tfd);
     close(ep);
     fb_close(&g_fb);
     sem_destroy(&g_render_sem);
