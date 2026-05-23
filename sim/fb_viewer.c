@@ -33,6 +33,10 @@
 #define TARGET_FPS   60
 
 /* Mirror of InputEvent enum from src/uid/input.h — kept in sync manually */
+#define SIM_INPUT_SWIPE_LEFT         2
+#define SIM_INPUT_SWIPE_RIGHT        3
+#define SIM_INPUT_SWIPE_UP           4
+#define SIM_INPUT_SWIPE_DOWN         5
 #define SIM_INPUT_POWER_BUTTON       6
 #define SIM_INPUT_VOLUME_UP          7
 #define SIM_INPUT_VOLUME_DOWN        8
@@ -130,9 +134,9 @@ int main(int argc, char **argv)
         SDL_TEXTUREACCESS_STREAMING,
         FB_W, FB_H);
 
-    SDL_SetWindowTitle(win, "EgePod  (Q=quit  P=power  Shift+P=menu  ↑↓=volume  click=tap)");
+    SDL_SetWindowTitle(win, "EgePod  (Q=quit  P=pwr  Shift+P=menu  ←→↑↓=swipe  +/-=vol  click=tap)");
     printf("fb_viewer: window %dx%d (%.0f%% scale).\n"
-           "  Keys: Q/Esc=quit  P=power  Shift+P=power-menu  Up/Down=volume  click=tap\n",
+           "  Keys: Q/Esc=quit  P=power  Shift+P=power-menu  Arrows=swipe  +/-=volume  click=tap\n",
            win_w, win_h, SCALE * 100.0f);
 
     uint32_t ms_per_frame = 1000 / TARGET_FPS;
@@ -157,13 +161,25 @@ int main(int argc, char **argv)
                     write_key_event(tap_path, SIM_INPUT_POWER_BUTTON_LONG);
                     printf("fb_viewer: synthetic power long-press\n");
                 } else if (sym == SDLK_p) {
-                    /* P → power short-press (screen on/off) */
+                    /* P → power short-press (screen on/off toggle) */
                     write_key_event(tap_path, SIM_INPUT_POWER_BUTTON);
                     printf("fb_viewer: synthetic power press\n");
+                } else if (sym == SDLK_LEFT) {
+                    write_key_event(tap_path, SIM_INPUT_SWIPE_LEFT);
+                    printf("fb_viewer: swipe left (next track)\n");
+                } else if (sym == SDLK_RIGHT) {
+                    write_key_event(tap_path, SIM_INPUT_SWIPE_RIGHT);
+                    printf("fb_viewer: swipe right (prev track)\n");
                 } else if (sym == SDLK_UP) {
+                    write_key_event(tap_path, SIM_INPUT_SWIPE_UP);
+                    printf("fb_viewer: swipe up (unlock / brightness+ / scroll up)\n");
+                } else if (sym == SDLK_DOWN) {
+                    write_key_event(tap_path, SIM_INPUT_SWIPE_DOWN);
+                    printf("fb_viewer: swipe down (brightness- / scroll down)\n");
+                } else if (sym == SDLK_EQUALS || sym == SDLK_PLUS) {
                     write_key_event(tap_path, SIM_INPUT_VOLUME_UP);
                     printf("fb_viewer: synthetic volume up\n");
-                } else if (sym == SDLK_DOWN) {
+                } else if (sym == SDLK_MINUS) {
                     write_key_event(tap_path, SIM_INPUT_VOLUME_DOWN);
                     printf("fb_viewer: synthetic volume down\n");
                 }

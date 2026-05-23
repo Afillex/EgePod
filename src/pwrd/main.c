@@ -275,7 +275,20 @@ int main(void)
                             }
 
 #ifdef SIMULATE
-                            LOGI("pwrd: sim shutdown — killing egepod daemons");
+                            LOGI("pwrd: sim %s — killing egepod daemons",
+                                 is_reboot ? "reboot" : "shutdown");
+                            if (is_reboot) {
+                                /* Write a .reboot sidecar alongside the FB file so
+                                 * simulate.sh detects it on viewer exit and re-execs
+                                 * the script, restarting all three daemons. */
+                                const char *fbp = getenv("EGEPOD_FB_FILE");
+                                if (!fbp) fbp = "/tmp/egepod_fb.raw";
+                                char rpath[600];
+                                snprintf(rpath, sizeof(rpath), "%s.reboot", fbp);
+                                FILE *rf = fopen(rpath, "w");
+                                if (rf) { fputs("1\n", rf); fclose(rf); }
+                                LOGI("pwrd: wrote reboot sidecar %s", rpath);
+                            }
                             system("pkill -TERM -f 'egepod_audiod|egepod_uid' 2>/dev/null");
                             g_quit = 1;
 #else

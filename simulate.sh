@@ -69,7 +69,7 @@ pkill -f fb_viewer_macos 2>/dev/null || true
 pkill -9 ffplay 2>/dev/null || true
 # Delete stale sidecar files; also delete the raw FB so no old-UI pixels survive
 # until uid renders its first frame (fb_open_sim zero-inits on create).
-rm -f "$FB_RAW" "$FB_RAW.tap" "$FB_RAW.page" 2>/dev/null || true
+rm -f "$FB_RAW" "$FB_RAW.tap" "$FB_RAW.page" "$FB_RAW.shutdown" "$FB_RAW.reboot" 2>/dev/null || true
 # Force-kill everything in the VM and poll until the processes are gone.
 # Two-wave kill: SIGTERM first so threads can unwind, then SIGKILL after 1 s.
 orb run -m "$VM" bash -c "
@@ -98,10 +98,16 @@ orb run -m "$VM" bash -c "
 # If ffplay lacks TCP-listen support (rare), use:
 #   nc -l $AUDIO_PORT | ffplay -f s16le -ar 44100 -ac 2 -nodisp -
 step "Starting macOS audio sink (ffplay TCP :$AUDIO_PORT)..."
-# ffplay 8.x dropped -ac; use -ch_layout stereo instead
-ffplay -f s16le -ar 44100 -ch_layout stereo -nodisp -loglevel warning \
-    "tcp://0.0.0.0:${AUDIO_PORT}?listen=1" \
-    </dev/null >>/tmp/ffplay_audio.log 2>&1 &
+# ffplay 8.x dropped -ac; use -ch_layout stereo instead.
+# Wrapped in a restart loop: ffplay's ?listen=1 mode exits after one connection,
+# so CMD_STOP closes the TCP fd and ffplay exits.  The loop re-binds within ~50 ms
+# so the next CMD_PLAY can reconnect without waiting 5 s.
+(while true; do
+    ffplay -f s16le -ar 44100 -ch_layout stereo -nodisp -loglevel warning \
+        "tcp://0.0.0.0:${AUDIO_PORT}?listen=1" \
+        </dev/null >>/tmp/ffplay_audio.log 2>&1
+    sleep 0.05
+done) &
 FFPLAY_PID=$!
 # Wait up to 3 s for ffplay to bind the port
 _bound=0
@@ -163,4 +169,12 @@ sz=$(stat -f%z "$FB_RAW" 2>/dev/null || echo 0)
 # ── 7. open the viewer ────────────────────────────────────────────────────────
 step "Opening EgePod framebuffer viewer  (Q or Esc to close)"
 echo ""
-exec "$VIEWER" "$FB_RAW"
+"$VIEWER" "$FB_RAW"
+
+# ── 8. handle reboot sidecar (pwrd writes this on CMD_REBOOT in sim) ─────────
+if [[ -f "$FB_RAW.reboot" ]]; then
+    rm -f "$FB_RAW.reboot"
+    step "EgePod rebooting — restarting simulation..."
+    sleep 0.5
+    exec "$0" "$@"
+fi
