@@ -44,7 +44,7 @@ int ipc_recv(int fd, IpcMsg *out);
 
 /* ── globals ─────────────────────────────────────────────────────────────── */
 
-static volatile int   g_quit          = 0;
+static _Atomic int    g_quit          = 0;
 static int            g_screen_on     = 1;
 static int            g_progress_tfd  = -1;  /* 20 Hz timerfd for progress bar redraws */
 static int            g_power_long_tfd = -1;  /* 750 ms timerfd for long-press detection */
@@ -455,8 +455,9 @@ int main(void)
 
                     /* Power menu takes priority over all other tap routing */
                     pthread_mutex_lock(&g_ui_lock);
-                    int pmenu = g_ui.power_menu_open;
-                    int locked = g_ui.locked;
+                    int pmenu    = g_ui.power_menu_open;
+                    int locked   = g_ui.locked;
+                    int lib_mode = g_ui.lib_mode;   /* snapshot — avoid bare race below */
                     pthread_mutex_unlock(&g_ui_lock);
 
                     if (pmenu) {
@@ -492,7 +493,7 @@ int main(void)
                     /* Lock screen: taps are ignored (only swipe-up unlocks) */
                     if (locked) break;
 
-                    if (g_ui.lib_mode) {
+                    if (lib_mode) {
                         /* Library view: y < back threshold → exit; else select row */
                         if (tap_y < UI_LIB_BACK_H) {
                             pthread_mutex_lock(&g_ui_lock);
@@ -557,17 +558,28 @@ int main(void)
                     break;
                 }
                 case INPUT_SWIPE_LEFT:
-                    if (g_screen_on && !g_ui.lib_mode && !g_ui.locked)
-                        ipc_send_cmd(audiod_fd, CMD_NEXT, 0);
+                    if (g_screen_on) {
+                        pthread_mutex_lock(&g_ui_lock);
+                        int sl_lm = g_ui.lib_mode, sl_lk = g_ui.locked;
+                        pthread_mutex_unlock(&g_ui_lock);
+                        if (!sl_lm && !sl_lk)
+                            ipc_send_cmd(audiod_fd, CMD_NEXT, 0);
+                    }
                     break;
                 case INPUT_SWIPE_RIGHT:
-                    if (g_screen_on && !g_ui.lib_mode && !g_ui.locked)
-                        ipc_send_cmd(audiod_fd, CMD_PREV, 0);
+                    if (g_screen_on) {
+                        pthread_mutex_lock(&g_ui_lock);
+                        int sr_lm = g_ui.lib_mode, sr_lk = g_ui.locked;
+                        pthread_mutex_unlock(&g_ui_lock);
+                        if (!sr_lm && !sr_lk)
+                            ipc_send_cmd(audiod_fd, CMD_PREV, 0);
+                    }
                     break;
                 case INPUT_SWIPE_UP:
                     if (g_screen_on) {
                         pthread_mutex_lock(&g_ui_lock);
                         int is_locked = g_ui.locked;
+                        int su_lm    = g_ui.lib_mode;   /* snapshot together */
                         pthread_mutex_unlock(&g_ui_lock);
                         if (is_locked) {
                             /* Swipe up unlocks */
@@ -578,7 +590,7 @@ int main(void)
                             LOGI("uid: unlocked");
                             break;
                         }
-                        if (g_ui.lib_mode) {
+                        if (su_lm) {
                             pthread_mutex_lock(&g_ui_lock);
                             int max_s = (int)g_ui.track_count - UI_LIB_VISIBLE;
                             if (max_s > 0 && g_ui.lib_scroll < max_s)
@@ -599,7 +611,10 @@ int main(void)
                     break;
                 case INPUT_SWIPE_DOWN:
                     if (g_screen_on) {
-                        if (g_ui.lib_mode) {
+                        pthread_mutex_lock(&g_ui_lock);
+                        int sd_lm = g_ui.lib_mode;
+                        pthread_mutex_unlock(&g_ui_lock);
+                        if (sd_lm) {
                             pthread_mutex_lock(&g_ui_lock);
                             if (g_ui.lib_scroll > 0) g_ui.lib_scroll--;
                             pthread_mutex_unlock(&g_ui_lock);

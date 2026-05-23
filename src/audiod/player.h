@@ -22,6 +22,11 @@ void player_set_state_callback(Player *p,
 /* Must be called periodically (~1 Hz) to push EVT_POSITION to subscribers.
  * Returns position_ms, or UINT32_MAX if not playing/paused. */
 uint32_t    player_get_position(Player *p);
+
+/* Send EVT_POSITION to all subscribers under p->lock.  Call from audiod main's
+ * tfd tick instead of a bare send() loop to prevent concurrent-send races with
+ * the playback thread's publish_state calls (both funnel through p->lock). */
+void player_broadcast_position(Player *p, uint32_t pos_ms);
 size_t      player_get_track_idx(Player *p);
 PlayerState player_get_state(Player *p);
 

@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
@@ -31,7 +32,7 @@
 #endif
 #define MAX_EVENTS   (MAX_IPC_CLIENTS + 2)
 
-static volatile int g_quit = 0;
+static _Atomic int  g_quit = 0;
 static int          g_tfd  = -1;   /* position timerfd — armed only while PLAYING */
 
 static void on_signal(int sig) { (void)sig; g_quit = 1; }
@@ -241,7 +242,6 @@ int main(void)
                     }
                 }
 
-                if (n_clients == 0) continue;   /* no subscribers — skip lock + send */
                 uint32_t pos = player_get_position(player);
                 static uint32_t last_pos = UINT32_MAX;
                 if (pos == UINT32_MAX) {
@@ -250,11 +250,9 @@ int main(void)
                     last_pos = UINT32_MAX;
                 } else if (pos != last_pos) {
                     last_pos = pos;
-                    IpcMsg pm = { .type = EVT_POSITION };
-                    pm.param.position_ms = pos;
-                    for (int j = 0; j < n_clients; j++)
-                        if (clients[j] >= 0)
-                            send(clients[j], &pm, sizeof(pm), MSG_DONTWAIT);
+                    /* Broadcast under p->lock to serialize with playback thread's
+                     * publish_state sends — prevents concurrent send() on same fd. */
+                    player_broadcast_position(player, pos);
                 }
                 continue;
             }

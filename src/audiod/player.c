@@ -24,6 +24,7 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <sched.h>
+#include <stdatomic.h>
 
 #define ALSA_CARD      0
 #define ALSA_DEVICE    0
@@ -79,8 +80,9 @@ struct Player {
     void (*state_cb)(PlayerState s, void *ud);
     void *state_cb_ud;
 
-    /* Set to 1 to request all threads exit. */
-    volatile int quit;
+    /* Set to 1 to request all threads exit.  _Atomic guarantees cross-thread
+     * visibility without a mutex for this simple flag. */
+    _Atomic int quit;
 };
 
 /* ── forward declarations ──────────────────────────────────────────────────── */
@@ -116,6 +118,7 @@ static void pcmbuf_free(PcmBuf *b)
     b->frames = b->rate = b->channels = 0;
 }
 
+/* Caller MUST hold p->lock — the subscriber list is owned by p->lock. */
 static void publish_event(Player *p, const IpcMsg *msg)
 {
     for (int i = 0; i < p->sub_count; i++) {
@@ -124,6 +127,20 @@ static void publish_event(Player *p, const IpcMsg *msg)
             LOGD("player: publish to fd %d failed: %s",
                  p->subscribers[i], strerror(errno));
     }
+}
+
+/* Public: send EVT_POSITION pos_ms to all subscribers under p->lock.
+ * Call from audiod main's tfd tick instead of a bare send() loop so that
+ * concurrent sends from the playback thread (via publish_state) are serialized
+ * through the same lock. */
+void player_broadcast_position(Player *p, uint32_t pos_ms)
+{
+    if (!p) return;
+    IpcMsg pm = { .type = EVT_POSITION };
+    pm.param.position_ms = pos_ms;
+    pthread_mutex_lock(&p->lock);
+    publish_event(p, &pm);
+    pthread_mutex_unlock(&p->lock);
 }
 
 static void publish_state(Player *p, PlayerState s)
@@ -275,7 +292,20 @@ static void load_track(Player *p, size_t idx)
             if (!p->quit) SET_STATE(p, PLAYER_ERROR, "decoder_decode failed");
             return;
         }
-        /* Discard anything a concurrent command loaded while we were decoding */
+        /* Validate that cur_track still points to the same file we decoded.
+         * A concurrent CMD_NEXT/PREV can change cur_track while the lock was
+         * dropped.  Storing a stale result would overwrite the correct track
+         * that already loaded, causing wrong audio and a stuck player state.
+         * (The prefetch thread has an identical guard at line ~190.) */
+        {
+            const TrackInfo *want = index_get_track(p->index, p->cur_track);
+            if (!want || strcmp(want->path, ti->path) != 0) {
+                LOGD("player: slow-decode result stale ('%s' ≠ cur) — discarding",
+                     ti->path);
+                decoder_free(dec_pcm, dec_frames, dec_channels);
+                return;
+            }
+        }
         pcmbuf_free(&p->cur_buf);
         p->cur_buf.pcm      = dec_pcm;
         p->cur_buf.frames   = dec_frames;

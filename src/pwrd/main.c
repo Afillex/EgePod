@@ -20,11 +20,17 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <time.h>
+#ifndef SIMULATE
+#include <sys/reboot.h>
+#include <linux/reboot.h>
+#endif
 
 #define BATTERY_INTERVAL_SEC    30  /* battery % changes ~1% per 6–10 min at 30mA */
 #define THERMAL_WARN_CELSIUS   45   /* notify UI above this */
@@ -34,7 +40,7 @@
 #define BATTERY_CAPACITY_PATH  "/sys/class/power_supply/battery/capacity"
 #define THERMAL_PATH           "/sys/class/thermal/thermal_zone0/temp"
 
-static volatile int g_quit = 0;
+static _Atomic int  g_quit = 0;
 static void on_signal(int sig) { (void)sig; g_quit = 1; }
 
 static int sysfs_read_u32(const char *path, uint32_t *out)
@@ -118,6 +124,7 @@ int main(void)
     int    client_fd = -1;
     uint32_t last_batt    = 0xFF;
     int      thermal_warn = 0;   /* 1 while above threshold (hysteresis gate) */
+    uint32_t g_volume     = 70;  /* current volume 0-100 */
 
     struct epoll_event events[4];
 
@@ -146,6 +153,12 @@ int main(void)
                 ev.data.fd = cfd;
                 epoll_ctl(ep, EPOLL_CTL_ADD, cfd, &ev);
                 LOGI("pwrd: uid connected");
+                /* Push current volume so UI is in sync immediately */
+                {
+                    IpcMsg vm = { .type = EVT_VOLUME };
+                    vm.param.volume = g_volume;
+                    send(cfd, &vm, sizeof(vm), MSG_DONTWAIT);
+                }
                 continue;
             }
 
@@ -205,6 +218,95 @@ int main(void)
                             }
                             LOGI("pwrd: screen on");
                             break;
+                        case CMD_SET_VOLUME: {
+                            uint32_t v = cmd.param.volume;
+                            if (v > 100) v = 100;
+                            g_volume = v;
+                            LOGI("pwrd: volume → %u%%", v);
+                            /* Broadcast EVT_VOLUME back to UI */
+                            if (client_fd >= 0) {
+                                IpcMsg m = { .type = EVT_VOLUME };
+                                m.param.volume = v;
+                                send(client_fd, &m, sizeof(m), MSG_DONTWAIT);
+                            }
+                            break;
+                        }
+                        case CMD_REBOOT:
+                        case CMD_SHUTDOWN: {
+                            const int is_reboot = (cmd.type == CMD_REBOOT);
+                            LOGI("pwrd: %s requested", is_reboot ? "reboot" : "shutdown");
+
+                            /* 1. Notify uid so it renders the shutdown splash. */
+                            if (client_fd >= 0) {
+                                IpcMsg m = { .type = EVT_SHUTDOWN_PENDING };
+                                send(client_fd, &m, sizeof(m), MSG_DONTWAIT);
+                            }
+
+                            /* 2. Notify audiod directly via its server socket so it
+                             *    can persist state before we reboot.  One-shot connect:
+                             *    if audiod crashed the connect fails silently, which is
+                             *    fine — no state to save if audiod is already dead. */
+                            {
+                                int afd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+                                if (afd >= 0) {
+                                    struct sockaddr_un aa = { .sun_family = AF_UNIX };
+                                    snprintf(aa.sun_path, sizeof(aa.sun_path), "%s",
+                                             AUDIOD_SOCK_PATH);
+                                    if (connect(afd, (struct sockaddr *)&aa, sizeof(aa)) == 0) {
+                                        IpcMsg sa = { .type = EVT_SHUTDOWN_PENDING };
+                                        send(afd, &sa, sizeof(sa), 0);
+                                        LOGI("pwrd: audiod notified of shutdown");
+                                    }
+                                    close(afd);
+                                }
+                            }
+
+                            /* 3. Give audiod 800 ms to persist + uid to render splash. */
+                            {
+                                struct timespec delay = { .tv_nsec = 800000000L };
+                                nanosleep(&delay, NULL);
+                            }
+
+#ifdef SIMULATE
+                            LOGI("pwrd: sim shutdown — killing egepod daemons");
+                            system("pkill -TERM -f 'egepod_audiod|egepod_uid' 2>/dev/null");
+                            g_quit = 1;
+#else
+                            /* 3a. Primary path: hand off to Android init via sys.powerctl.
+                             *     init's DoReboot() stops services in reverse order, syncs,
+                             *     unmounts /sdcard and /data, then calls reboot() itself
+                             *     with the PMIC poweroff handler properly registered. */
+                            sync();
+                            {
+                                const char *prop = is_reboot
+                                    ? "/system/bin/setprop sys.powerctl reboot,userrequested"
+                                    : "/system/bin/setprop sys.powerctl shutdown,userrequested";
+                                int sp_rc = system(prop);
+                                LOGI("pwrd: setprop sys.powerctl → %d", sp_rc);
+                            }
+
+                            /* 3b. Fallback: if init doesn't begin killing us within 6 s,
+                             *     it is broken — fall back to direct reboot(2).  If init
+                             *     does its job we are SIGKILLed before this loop completes. */
+                            for (int fb = 0; fb < 60; fb++) {
+                                struct timespec t = { .tv_nsec = 100000000L };
+                                nanosleep(&t, NULL);
+                            }
+                            LOGW("pwrd: init did not honor sys.powerctl after 6s — direct reboot(2)");
+                            sync();
+                            if (is_reboot)
+                                reboot(LINUX_REBOOT_CMD_RESTART);
+                            else
+                                reboot(LINUX_REBOOT_CMD_POWER_OFF);
+
+                            /* reboot(2) returned — pm_power_off is unbound in the kernel.
+                             * Spin on pause() so init's respawn policy cannot relaunch us
+                             * into a "device still on" illusion. */
+                            LOGE("pwrd: reboot(2) returned — pm_power_off likely unbound");
+                            while (1) pause();
+#endif
+                            break;
+                        }
                         default:
                             LOGW("pwrd: unknown cmd type 0x%02x", cmd.type);
                             break;
