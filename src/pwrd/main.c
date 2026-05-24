@@ -243,6 +243,22 @@ int main(void)
                             const int is_reboot = (cmd.type == CMD_REBOOT);
                             LOGI("pwrd: %s requested", is_reboot ? "reboot" : "shutdown");
 
+#ifdef SIMULATE
+                            /* Write the reboot sidecar BEFORE notifying uid so that
+                             * simulate.sh finds it the moment the viewer closes.
+                             * Writing it after the 800ms delay (below) races with
+                             * simulate.sh's post-viewer check. */
+                            if (is_reboot) {
+                                const char *fbp = getenv("EGEPOD_FB_FILE");
+                                if (!fbp) fbp = "/tmp/egepod_fb.raw";
+                                char rpath[600];
+                                snprintf(rpath, sizeof(rpath), "%s.reboot", fbp);
+                                FILE *rf = fopen(rpath, "w");
+                                if (rf) { fputs("1\n", rf); fclose(rf); }
+                                LOGI("pwrd: wrote reboot sidecar %s", rpath);
+                            }
+#endif
+
                             /* 1. Notify uid so it renders the shutdown splash. */
                             if (client_fd >= 0) {
                                 IpcMsg m = { .type = EVT_SHUTDOWN_PENDING };
@@ -277,18 +293,6 @@ int main(void)
 #ifdef SIMULATE
                             LOGI("pwrd: sim %s — killing egepod daemons",
                                  is_reboot ? "reboot" : "shutdown");
-                            if (is_reboot) {
-                                /* Write a .reboot sidecar alongside the FB file so
-                                 * simulate.sh detects it on viewer exit and re-execs
-                                 * the script, restarting all three daemons. */
-                                const char *fbp = getenv("EGEPOD_FB_FILE");
-                                if (!fbp) fbp = "/tmp/egepod_fb.raw";
-                                char rpath[600];
-                                snprintf(rpath, sizeof(rpath), "%s.reboot", fbp);
-                                FILE *rf = fopen(rpath, "w");
-                                if (rf) { fputs("1\n", rf); fclose(rf); }
-                                LOGI("pwrd: wrote reboot sidecar %s", rpath);
-                            }
                             system("pkill -TERM -f 'egepod_audiod|egepod_uid' 2>/dev/null");
                             g_quit = 1;
 #else

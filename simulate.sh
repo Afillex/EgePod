@@ -172,6 +172,13 @@ echo ""
 "$VIEWER" "$FB_RAW"
 
 # ── 8. handle reboot sidecar (pwrd writes this on CMD_REBOOT in sim) ─────────
+# pwrd writes the sidecar before sending EVT_SHUTDOWN_PENDING, so it should
+# already exist when the viewer exits.  Poll briefly as a safety net for slow
+# VirtioFS flushes (the sidecar file is small; 20 × 100ms = 2 s max wait).
+for _ri in $(seq 1 20); do
+    [[ -f "$FB_RAW.reboot" ]] && break
+    sleep 0.1
+done
 if [[ -f "$FB_RAW.reboot" ]]; then
     rm -f "$FB_RAW.reboot"
     step "EgePod rebooting — restarting simulation..."
