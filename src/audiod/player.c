@@ -434,15 +434,20 @@ static void *playback_thread(void *arg)
         pthread_mutex_unlock(&p->lock);
 
         if (!wr_alsa) {
-            /* Open ALSA only when still playing (avoids reopen after CMD_STOP). */
+            /* Open ALSA only when still playing (avoids reopen after CMD_STOP).
+             * After opening, fall through to write the chunk we already copied —
+             * the old `continue` was silently discarding it (93ms gap on every
+             * play-after-stop with PERIOD_FRAMES=4096 @ 44100 Hz). */
             pthread_mutex_lock(&p->lock);
             if (p->state == PLAYER_PLAYING) {
                 p->alsa = alsa_out_open(ALSA_CARD, ALSA_DEVICE,
                                         wr_rate, wr_channels, 16);
                 if (!p->alsa) SET_STATE(p, PLAYER_ERROR, "ALSA open failed");
             }
+            wr_alsa = p->alsa;
             pthread_mutex_unlock(&p->lock);
-            continue;
+            if (!wr_alsa) continue;
+            /* fall through → alsa_out_write writes the chunk */
         }
         if (alsa_out_write(wr_alsa, pcm_local, chunk) != 0) {
             LOGE("player: alsa_out_write failed; reopening (rate=%u ch=%u)",

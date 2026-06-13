@@ -82,3 +82,12 @@
 +CONFIG_LEDS_VIBRATOR=n
  CONFIG_LEDS_MT65XX=y            # keep for lcd-backlight sysfs node
 +CONFIG_RFKILL=y                 # needed by pwrd rfkill.c
+
+# ── Power-off / reboot — bind PMIC handlers so reboot(2) actually cuts power ──
+# Without these, LINUX_REBOOT_CMD_POWER_OFF halts the CPUs but leaves the PMIC
+# powered — the device sits black, draining the battery silently.
+# Verify after flash: zcat /proc/config.gz | grep -E 'POWER_RESET_MTK|MTK_PMIC_KEYS'
++CONFIG_POWER_RESET=y
++CONFIG_POWER_RESET_MTK_PMIC=y     # registers pm_power_off via MT6359 PMIC driver
++CONFIG_MTK_PMIC_KEYS=y            # also provides long-press-power → hard poweroff
++CONFIG_REBOOT_MODE=y              # /sys/firmware/reboot_mode (warm/cold reboot)

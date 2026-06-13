@@ -1,4 +1,7 @@
 out/
+graphify-out/
 *.raw
 *.raw.page
 nohup.out
+.DS_Store
+**/.DS_Store

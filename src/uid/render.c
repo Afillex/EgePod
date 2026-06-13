@@ -502,6 +502,85 @@ static void render_library(uint32_t *buf, uint32_t stride, const UiState *st)
     }
 }
 
+/* ── Lock screen ──────────────────────────────────────────────────────────── */
+static void render_lock_screen(uint32_t *buf, uint32_t stride, const UiState *st)
+{
+    buf_fill_rrect(buf, stride, W_FB, H_FB, 0, 0, W_FB, H_FB, 0, C_BG);
+
+    /* Status bar: clock + battery */
+    {
+        time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
+        char clk[8]; snprintf(clk, sizeof(clk), "%02d:%02d", tm.tm_hour, tm.tm_min);
+        int sy = STATUS_H - 10;
+        ttf_draw(buf, stride, W_FB, H_FB, 28, sy, clk, C_TEXT_2, 16.0f);
+        char bat[8]; snprintf(bat, sizeof(bat), "%u%%", st->battery_pct);
+        ttf_right(buf, stride, W_FB, H_FB, W_FB-28, sy, bat, C_TEXT_2, 16.0f);
+    }
+
+    /* Large HH:MM clock centred in upper half */
+    {
+        time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
+        char clk[8]; snprintf(clk, sizeof(clk), "%02d:%02d", tm.tm_hour, tm.tm_min);
+        ttf_centred(buf, stride, W_FB, H_FB, 0, W_FB, 480, clk, C_TEXT, 96.0f);
+    }
+
+    /* "SWIPE UP TO UNLOCK" hint near bottom */
+    ttf_centred(buf, stride, W_FB, H_FB, 0, W_FB, 1160,
+                "SWIPE UP TO UNLOCK", C_TEXT_3, 14.0f);
+}
+
+/* ── Power menu overlay ───────────────────────────────────────────────────── */
+static void render_power_menu(uint32_t *buf, uint32_t stride)
+{
+    /* 60% dim layer over the entire screen */
+    for (int y = 0; y < H_FB; y++) {
+        uint32_t *row = buf + (size_t)y * stride;
+        for (int x = 0; x < W_FB; x++) {
+            uint32_t p = row[x];
+            uint32_t r = (p >> 16) & 0xFF;
+            uint32_t g = (p >>  8) & 0xFF;
+            uint32_t b =  p        & 0xFF;
+            row[x] = 0xFF000000 | ((r * 40 / 100) << 16)
+                                | ((g * 40 / 100) <<  8)
+                                |  (b * 40 / 100);
+        }
+    }
+
+    /* Card background */
+    buf_fill_rrect(buf, stride, W_FB, H_FB,
+                   UI_PMENU_X, UI_PMENU_Y, UI_PMENU_W, UI_PMENU_H,
+                   18, 0xFF1A1A1A);
+
+    /* Buttons: Lock / Reboot / Shutdown */
+    static const struct { const char *label; int y; } btns[3] = {
+        { "LOCK",     UI_PMENU_BTN_LOCK_Y },
+        { "REBOOT",   UI_PMENU_BTN_REBT_Y },
+        { "SHUTDOWN", UI_PMENU_BTN_SHDN_Y },
+    };
+    for (int i = 0; i < 3; i++) {
+        buf_fill_rrect(buf, stride, W_FB, H_FB,
+                       UI_PMENU_BTN_X, btns[i].y,
+                       UI_PMENU_BTN_W, UI_PMENU_BTN_H, 10, 0xFF252525);
+        ttf_centred(buf, stride, W_FB, H_FB,
+                    UI_PMENU_BTN_X, UI_PMENU_BTN_X + UI_PMENU_BTN_W,
+                    btns[i].y + UI_PMENU_BTN_H/2 + 8,
+                    btns[i].label, C_TEXT, 20.0f);
+    }
+
+    /* "POWER MENU" title inside card */
+    ttf_centred(buf, stride, W_FB, H_FB,
+                UI_PMENU_X, UI_PMENU_X + UI_PMENU_W,
+                UI_PMENU_Y + 38, "POWER MENU", C_TEXT_2, 14.0f);
+}
+
+/* ── Shutdown splash ──────────────────────────────────────────────────────── */
+static void render_shutdown_splash(uint32_t *buf, uint32_t stride)
+{
+    buf_fill_rrect(buf, stride, W_FB, H_FB, 0, 0, W_FB, H_FB, 0, C_BG);
+    ttf_centred(buf, stride, W_FB, H_FB, 0, W_FB, H_FB/2 + 16,
+                "SHUTTING DOWN", C_TEXT_2, 24.0f);
+}
+
 /* ── render_frame ───────────────────────────────────────────────────────── */
 void render_frame(FbCtx *fb, const UiState *st)
 {
@@ -521,9 +600,15 @@ void render_frame(FbCtx *fb, const UiState *st)
                    "wmemset assumes 32-bit wchar_t");
     wmemset((wchar_t *)vbuf, (wchar_t)C_BG, W_FB * H_FB);
 
-    if (st->lib_mode) {
-        render_library(buf, stride, st);
+    if (st->shutting_down) {
+        render_shutdown_splash(buf, stride);
     } else {
+        /* Base view: lock screen > library > now-playing */
+        if (st->locked)
+            render_lock_screen(buf, stride, st);
+        else if (st->lib_mode)
+            render_library(buf, stride, st);
+        else {
 
     /* ── Status bar ── */
     {
@@ -737,7 +822,12 @@ void render_frame(FbCtx *fb, const UiState *st)
                      (int)((uint64_t)st->brightness * (uint64_t)UI_BRIGHT_W / 100);
         buf_fill_circle(buf, stride, W_FB, H_FB, bdot_x, bar_cy, 5, C_TEXT_2);
     }
-    } /* end else (player view) */
+        } /* end else (now-playing) */
+
+        /* Power menu overlays the base view on long-press */
+        if (st->power_menu_open)
+            render_power_menu(buf, stride);
+    } /* end !shutting_down */
 
     /* Scale-blit: nearest-neighbour upscale from W_FB×H_FB to actual display.
      * On the Redmi Note 10S (1080×2400) this expands the 720×1280 canvas 1.5×

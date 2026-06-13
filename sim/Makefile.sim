@@ -32,7 +32,9 @@ AUDIOD_SRC := src/audiod/main.c        \
               src/audiod/player.c      \
               src/audiod/decoder.c     \
               src/audiod/alsa_out_sim.c \
-              src/audiod/index.c
+              src/audiod/index.c       \
+              src/audiod/persist.c     \
+              src/audiod/h2w.c
 
 $(OUT)/egepod_audiod: $(AUDIOD_SRC) | $(OUT)
 	$(CC) $(CFLAGS) $(AUDIOD_SRC) $(LDFLAGS) -o $@

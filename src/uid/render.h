@@ -41,6 +41,18 @@
 #define UI_BRIGHT_X        36
 #define UI_BRIGHT_W       648
 
+/* Power menu overlay (720×1280 design space) */
+#define UI_PMENU_X         160
+#define UI_PMENU_W         400
+#define UI_PMENU_Y         450
+#define UI_PMENU_H         380
+#define UI_PMENU_BTN_X    (UI_PMENU_X + 20)
+#define UI_PMENU_BTN_W    (UI_PMENU_W - 40)
+#define UI_PMENU_BTN_H     80
+#define UI_PMENU_BTN_LOCK_Y  (UI_PMENU_Y + 70)
+#define UI_PMENU_BTN_REBT_Y  (UI_PMENU_BTN_LOCK_Y + UI_PMENU_BTN_H + 12)
+#define UI_PMENU_BTN_SHDN_Y  (UI_PMENU_BTN_REBT_Y + UI_PMENU_BTN_H + 12)
+
 #define MAX_LIB_TRACKS    256
 
 typedef struct {
@@ -63,6 +75,10 @@ typedef struct {
     uint32_t    library_loaded;
     LibEntry    library[MAX_LIB_TRACKS];
     uint32_t    brightness;   /* 0–100 */
+    uint32_t    volume;        /* 0–100 */
+    int         locked;        /* 1 = input-locked; shows lock view when screen on */
+    int         power_menu_open; /* 1 = power-menu overlay visible */
+    int         shutting_down; /* 1 = show shutdown splash, ignore input */
 } UiState;
 
 void render_frame(FbCtx *fb, const UiState *st);

@@ -147,7 +147,7 @@ orb run -m "$VM" bash -c "
     nohup ./out/sim/egepod_uid > /tmp/uid.log 2>&1 &
     sleep 2
     # Quick sanity check
-    running=\$(ps aux | grep -cE 'egepod_(audiod|pwrd|uid)' || true)
+    running=\$(pgrep -c -f 'out/sim/egepod_(audiod|pwrd|uid)' 2>/dev/null || echo 0)
     echo \"Daemons running: \$running/3\"
     journalctl -n 20 --no-pager 2>/dev/null | grep egepod | grep -v 'DEBUG\|WARN.*sysfs' | tail -6 || true
 " || fatal "Failed to start daemons in VM"
